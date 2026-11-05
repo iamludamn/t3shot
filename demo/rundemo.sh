@@ -25,5 +25,5 @@ for i in $(seq 1 280); do [ -f "$D/done" ] && break; sleep 1; done
 sleep 1; kill -INT $FF; wait $FF 2>/dev/null
 ls -la "$OUT"; echo "--- app.err"; tail -5 "$D/app.err"; echo "--- app.log"; tail -5 "$D/app.log"
 rm -rf "$D/f"; mkdir -p "$D/f"
-/opt/homebrew/bin/ffmpeg -loglevel error -i "$OUT" -vf "fps=1/3,scale=640:-1,tile=4x6:padding=4" -frames:v 1 "${OUT%.mov}-sheet.png"
+/opt/homebrew/bin/ffmpeg -y -loglevel error -i "$OUT" -vf "fps=1/3,scale=640:-1,tile=4x6:padding=4" -frames:v 1 "${OUT%.mov}-sheet.png"
 ls -la "${OUT%.mov}-sheet.png"

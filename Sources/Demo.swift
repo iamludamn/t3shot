@@ -101,14 +101,17 @@ final class DemoScript {
 
     private func place(_ c: AnnotateController) {
         // 演示里窗口放大到屏幕的 62% 宽，录出来的视频里看得清
+        c.window.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)   // 浮在舞台之上
         let s = DemoScript.screen.frame
         let w = s.width * 0.62, h = min(w * 0.62, s.height * 0.72)
         c.window.setFrame(NSRect(x: s.midX - w / 2, y: s.midY - h / 2 + s.height * 0.04, width: w, height: h), display: true)
     }
 
     private func crop(_ r: CGRect) -> NSImage {
-        let cg = bgCG.cropping(to: r)!
-        return NSImage(cgImage: cg, size: NSSize(width: r.width, height: r.height))
+        // 用 NSBitmapImageRep 包一层：NSImage(cgImage:) 在 Retina 上会报告 2 倍像素，批注坐标就错了
+        let rep = NSBitmapImageRep(cgImage: bgCG.cropping(to: r)!)
+        let img = NSImage(size: NSSize(width: r.width, height: r.height)); img.addRepresentation(rep)
+        return img
     }
 
     /// 模拟拖拽框选：选框从左上角拉到右下角
@@ -180,7 +183,7 @@ final class DemoScript {
 
         let screen = DemoScript.screen.frame
         stage = NSWindow(contentRect: screen, styleMask: [.borderless], backing: .buffered, defer: false)
-        stage.level = .normal; stage.isOpaque = true
+        stage.level = .floating; stage.isOpaque = true   // 演示期间盖住其他 App，避免被切到前台的窗口挡住
         stageView.image = bg; stage.contentView = stageView
         stage.setFrame(screen, display: true)
         NSApp.activate(ignoringOtherApps: true)
@@ -223,7 +226,9 @@ final class DemoScript {
         await say("⌘K 打开目标选择器：每组只露出最相关的几条")
         await keys("⌘  K", hold: 0.8)
         c2.openPicker()
-        await sleep(2.4)
+        await sleep(0.2)
+        c2.pickerController?.raise()
+        await sleep(2.2)
         guard let picker = c2.pickerController else { return finish() }
         let tid = firstLink.flatMap { $0.path.split(separator: "/").last.map(String.init)?.removingPercentEncoding }
         await say("运行中的线程排在前面，标着「排队跟进」")
@@ -247,6 +252,7 @@ final class DemoScript {
         await sleep(1.6)
         caption.hide()
         c2.window.orderOut(nil)
+        stage.level = .normal; NSApp.presentationOptions = []
         // 舞台留在后面当底，只让 T3 Code 的窗口浮上来
         if let l = r2?.link ?? firstLink { T3Open.open(l) }
         await sleep(Double(env["T3SHOT_DEMO_TAIL"] ?? "16") ?? 16)

@@ -157,6 +157,8 @@ final class PickerController: NSObject, NSSearchFieldDelegate, NSPopoverDelegate
         vc.view.window?.makeFirstResponder(search)
     }
     func close() { popover.close() }
+    /// 父窗口被提到较高层级时，弹出层跟着提上去
+    func raise() { vc.view.window?.level = .popUpMenu }
 
     @objc private func refresh() { Task { await Directory.shared.refresh() } }
 
