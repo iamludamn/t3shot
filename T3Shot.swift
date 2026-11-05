@@ -166,6 +166,7 @@ final class App: NSObject, NSApplicationDelegate {
     let sendBtn = NSButton(title: "发送  ⌘↵", target: nil, action: nil)
     var targets: [Target] = []
     let imageURL: URL
+    var appActivity: NSObjectProtocol?
     let demo: Bool
     let shotOut: String?
 
@@ -178,6 +179,8 @@ final class App: NSObject, NSApplicationDelegate {
         buildMenu()
         buildWindow()
         NSApp.activate(ignoringOtherApps: true)
+        // 自动演示靠定时器驱动；窗口无人看时 App Nap 会把它压到几乎不动，所以演示期间禁用。
+        if demo { appActivity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .idleSystemSleepDisabled], reason: "T3Shot demo") }
         if ProcessInfo.processInfo.environment["T3SHOT_PRINT_WINDOW_ID"] == "1" { fputs("WINDOW_ID=\(window.windowNumber)\n", stderr) }
         if targets.isEmpty { setStatus("没有目标：请在 ~/.config/t3shot/targets.json 里配置 webhook", error: true) }
         if demo { runDemo() }
@@ -470,7 +473,8 @@ final class App: NSObject, NSApplicationDelegate {
         if ProcessInfo.processInfo.environment["T3SHOT_SLOW"] == "1" { return runSlowDemo() }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [self] in
             let w = canvas.iw, h = canvas.ih
-            canvas.marks = [.rect(CGRect(x: w * 0.34, y: h * 0.50, width: w * 0.32, height: h * 0.07))]
+            let b = (ProcessInfo.processInfo.environment["T3SHOT_BOX"] ?? "0.34,0.50,0.32,0.07").split(separator: ",").compactMap { Double($0) }
+            canvas.marks = [.rect(CGRect(x: w * b[0], y: h * b[1], width: w * b[2], height: h * b[3]))]
             canvas.needsDisplay = true
             note.string = ProcessInfo.processInfo.environment["T3SHOT_NOTE"] ?? "自检：红框处的按钮在暗色模式下看不清。"
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
