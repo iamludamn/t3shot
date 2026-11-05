@@ -383,7 +383,7 @@ final class Directory {
 
 // MARK: - 投递
 
-struct DeliveryResult { let message: String; let link: URL? }
+struct DeliveryResult { let message: String; let link: URL?; var threadId: String? = nil }
 
 enum Delivery {
     /// 新线程：先把图传到项目所在机器（能传的话），再 POST 项目的 scheduler webhook；之后在该项目里找到刚建出来的线程。
@@ -414,17 +414,17 @@ enum Delivery {
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             guard (200..<300).contains(code) else { throw T3Error("webhook 返回 \(code)：\(String(data: data.prefix(120), encoding: .utf8) ?? "")") }
             // webhook 只回 deliveryId；在项目里轮询刚创建的线程，拿到链接。
-            var link: URL?; var title: String?
+            var link: URL?; var title: String?; var newId: String?
             for _ in 0..<16 {
                 try? await Task.sleep(for: .seconds(1.5))
                 if let ts = try? await d.env.client.call("t3_thread_list", ["projectId": d.projectId, "limit": 5])["threads"] as? [[String: Any]],
                    let t = ts.first(where: { (parseISO($0["createdAt"]) ?? .distantPast) >= started.addingTimeInterval(-3) }),
                    let tid = t["threadId"] as? String {
-                    link = threadWebLink(env: d.env.id, thread: tid); title = t["title"] as? String; break
+                    link = threadWebLink(env: d.env.id, thread: tid); title = t["title"] as? String; newId = tid; break
                 }
             }
             let img = remotePath != nil ? "截图已作为附件送到 \(d.env.label)" : "图片未送达（\(uploadError ?? "")）"
-            return DeliveryResult(message: title.map { "已新建线程「\($0)」· \(img)" } ?? "已投递到 webhook（HTTP \(code)），线程创建中 · \(img)", link: link)
+            return DeliveryResult(message: title.map { "已新建线程「\($0)」· \(img)" } ?? "已投递到 webhook（HTTP \(code)），线程创建中 · \(img)", link: link, threadId: newId)
 
         case .thread(let tid, let status):
             let active = Destination.activeStatuses.contains(status)
@@ -437,13 +437,13 @@ enum Delivery {
                 // 空闲线程：原生附件 + 立即开始新一轮
                 _ = try await d.env.client.call("t3_thread_send_attachments", ["threadId": tid, "message": text,
                     "attachments": [["type": "image", "id": aid, "name": fileName, "mimeType": "image/png", "sizeBytes": png.count]]])
-                return DeliveryResult(message: "已发送，线程开始新一轮（截图为原生附件）", link: link)
+                return DeliveryResult(message: "已发送，线程开始新一轮（截图为原生附件）", link: link, threadId: tid)
             }
             // 活跃线程：follow-up 排队，不 steer、不打断
             let r = try await d.env.client.call("t3_thread_send", ["threadId": tid, "message": text, "mode": "queue",
                                                                    "clientRequestId": "t3shot-\(UUID().uuidString)"])
             let queued = (r["delivery"] as? String) == "queued"
-            return DeliveryResult(message: queued ? "已排队为下一轮 follow-up，不打断当前任务" : "已发送，线程开始新一轮", link: link)
+            return DeliveryResult(message: queued ? "已排队为下一轮 follow-up，不打断当前任务" : "已发送，线程开始新一轮", link: link, threadId: tid)
         }
     }
 }

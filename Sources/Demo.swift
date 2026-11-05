@@ -16,7 +16,7 @@ final class HUD {
     let label = NSTextField(labelWithString: "")
     init(size: CGFloat, weight: NSFont.Weight = .semibold) {
         panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 200, height: 60), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-        panel.isOpaque = false; panel.backgroundColor = .clear; panel.level = .statusBar; panel.hasShadow = true
+        panel.isOpaque = false; panel.backgroundColor = .clear; panel.level = NSWindow.Level(rawValue: NSWindow.Level.popUpMenu.rawValue + 1); panel.hasShadow = true
         panel.ignoresMouseEvents = true; panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         label.font = .systemFont(ofSize: size, weight: weight); label.textColor = .labelColor; label.alignment = .center
         label.translatesAutoresizingMaskIntoConstraints = false
@@ -68,6 +68,7 @@ final class StageView: NSView {
 final class DemoScript {
     /// 录屏的是主显示器（带菜单栏的那块），舞台和窗口都放在这里
     static var screen: NSScreen { NSScreen.screens.first ?? NSScreen.main! }
+    static let stageLevel = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 2)
     let env = ProcessInfo.processInfo.environment
     var stage: NSWindow!
     let stageView = StageView()
@@ -76,7 +77,7 @@ final class DemoScript {
     var bg: NSImage!
     var bgCG: CGImage!              // 原始像素（Retina 上 NSImage.cgImage 会给出 2 倍图，不能用来裁剪）
     var firstLink: URL?
-    var firstThreadTitle: String?
+    var firstThreadId: String?
 
     func sleep(_ s: Double) async { try? await Task.sleep(for: .seconds(s)) }
 
@@ -101,7 +102,7 @@ final class DemoScript {
 
     private func place(_ c: AnnotateController) {
         // 演示里窗口放大到屏幕的 62% 宽，录出来的视频里看得清
-        c.window.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)   // 浮在舞台之上
+        c.window.level = NSWindow.Level(rawValue: DemoScript.stageLevel.rawValue + 1)   // 浮在舞台之上
         let s = DemoScript.screen.frame
         let w = s.width * 0.62, h = min(w * 0.62, s.height * 0.72)
         c.window.setFrame(NSRect(x: s.midX - w / 2, y: s.midY - h / 2 + s.height * 0.04, width: w, height: h), display: true)
@@ -183,7 +184,7 @@ final class DemoScript {
 
         let screen = DemoScript.screen.frame
         stage = NSWindow(contentRect: screen, styleMask: [.borderless], backing: .buffered, defer: false)
-        stage.level = .floating; stage.isOpaque = true   // 演示期间盖住其他 App，避免被切到前台的窗口挡住
+        stage.level = DemoScript.stageLevel; stage.isOpaque = true   // 演示期间盖住其他 App、菜单栏和 Dock
         stageView.image = bg; stage.contentView = stageView
         stage.setFrame(screen, display: true)
         NSApp.activate(ignoringOtherApps: true)
@@ -209,6 +210,7 @@ final class DemoScript {
         await keys("⌘  ↵", hold: 0.8)
         let r1 = await waitSent(c1)
         firstLink = r1?.link
+        firstThreadId = r1?.threadId
         await say(r1 != nil ? "webhook 建出了新线程，agent 已经在 omarchy 上开始处理" : "投递失败：见状态栏")
         await sleep(3.2)
         c1.window.performClose(nil)
@@ -230,13 +232,15 @@ final class DemoScript {
         c2.pickerController?.raise()
         await sleep(2.2)
         guard let picker = c2.pickerController else { return finish() }
-        let tid = firstLink.flatMap { $0.path.split(separator: "/").last.map(String.init)?.removingPercentEncoding }
+        let tid = firstThreadId
         await say("运行中的线程排在前面，标着「排队跟进」")
         let match: (Destination) -> Bool = { d in
             if let tid { return d.threadId == tid }
             return !d.isNew && d.isActive && d.project == project
         }
-        for _ in 0..<12 { if picker.stepToward(match) { break }; await sleep(0.32) }
+        var found = false
+        for _ in 0..<14 { if picker.stepToward(match) { found = true; break }; await sleep(0.32) }
+        guard found else { fputs("选择器里没找到刚建的线程 \(tid ?? "-")\n", stderr); return finish() }
         await sleep(1.0)
         await keys("↵", hold: 0.5)
         picker.activate()
