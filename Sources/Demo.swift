@@ -41,9 +41,16 @@ final class StageView: NSView {
     var image: NSImage?
     var selection: CGRect?          // 屏幕坐标（视图坐标，左下原点）
     var dim: CGFloat = 0
+    var pixelSize = CGSize(width: 1920, height: 1080)
+    /// 等比铺满（aspect fill），居中裁掉多余部分
+    var imageRect: CGRect {
+        let k = max(bounds.width / pixelSize.width, bounds.height / pixelSize.height)
+        let w = pixelSize.width * k, h = pixelSize.height * k
+        return CGRect(x: bounds.midX - w / 2, y: bounds.midY - h / 2, width: w, height: h)
+    }
     override func draw(_ r: NSRect) {
         NSColor.black.setFill(); bounds.fill()
-        image?.draw(in: bounds)
+        image?.draw(in: imageRect)
         guard dim > 0 else { return }
         let path = NSBezierPath(rect: bounds)
         if let s = selection { path.append(NSBezierPath(rect: s)); path.windingRule = .evenOdd }
@@ -64,9 +71,10 @@ final class DemoScript {
     let env = ProcessInfo.processInfo.environment
     var stage: NSWindow!
     let stageView = StageView()
-    let keycap = HUD(size: 30, weight: .bold)
-    let caption = HUD(size: 17, weight: .medium)
+    let keycap = HUD(size: 46, weight: .bold)
+    let caption = HUD(size: 24, weight: .medium)
     var bg: NSImage!
+    var bgCG: CGImage!              // 原始像素（Retina 上 NSImage.cgImage 会给出 2 倍图，不能用来裁剪）
     var firstLink: URL?
     var firstThreadTitle: String?
 
@@ -81,23 +89,25 @@ final class DemoScript {
         }
     }
 
-    private func say(_ s: String) async { caption.show(s, y: 28); await sleep(0.05) }
-    private func keys(_ s: String, hold: Double = 1.1) async { keycap.show(s, y: 140); await sleep(hold); keycap.hide() }
+    private func say(_ s: String) async { caption.show(s, y: 36); await sleep(0.05) }
+    private func keys(_ s: String, hold: Double = 1.1) async { keycap.show(s, y: DemoScript.screen.frame.height * 0.2); await sleep(hold); keycap.hide() }
 
     /// 背景图像素（左上原点）→ 舞台视图坐标（左下原点）
     private func toView(_ r: CGRect) -> CGRect {
-        let px = bg.representations.first.map { CGSize(width: $0.pixelsWide, height: $0.pixelsHigh) } ?? bg.size
-        let sx = stageView.bounds.width / px.width, sy = stageView.bounds.height / px.height
-        return CGRect(x: r.minX * sx, y: stageView.bounds.height - r.maxY * sy, width: r.width * sx, height: r.height * sy)
+        let ir = stageView.imageRect
+        let k = ir.width / CGFloat(bgCG.width)
+        return CGRect(x: ir.minX + r.minX * k, y: ir.maxY - r.maxY * k, width: r.width * k, height: r.height * k)
     }
 
     private func place(_ c: AnnotateController) {
-        let s = DemoScript.screen.frame, f = c.window.frame
-        c.window.setFrameOrigin(NSPoint(x: s.midX - f.width / 2, y: s.midY - f.height / 2 + 40))
+        // 演示里窗口放大到屏幕的 62% 宽，录出来的视频里看得清
+        let s = DemoScript.screen.frame
+        let w = s.width * 0.62, h = min(w * 0.62, s.height * 0.72)
+        c.window.setFrame(NSRect(x: s.midX - w / 2, y: s.midY - h / 2 + s.height * 0.04, width: w, height: h), display: true)
     }
 
     private func crop(_ r: CGRect) -> NSImage {
-        let cg = bg.cgImage(forProposedRect: nil, context: nil, hints: nil)!.cropping(to: r)!
+        let cg = bgCG.cropping(to: r)!
         return NSImage(cgImage: cg, size: NSSize(width: r.width, height: r.height))
     }
 
@@ -152,6 +162,10 @@ final class DemoScript {
     func run() async {
         guard let path = env["T3SHOT_DEMO_BG"], let img = NSImage(contentsOfFile: path) else { fputs("需要 T3SHOT_DEMO_BG\n", stderr); exit(2) }
         bg = img
+        guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
+              let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else { exit(2) }
+        bgCG = cg
+        stageView.pixelSize = CGSize(width: cg.width, height: cg.height)
         let shots = rects("T3SHOT_DEMO_SHOTS"), boxes = rects("T3SHOT_DEMO_BOXES")
         let notes = (env["T3SHOT_DEMO_NOTES"] ?? "登录按钮在暗色模式下几乎看不清||补充：输入框边框也看不清").components(separatedBy: "||")
         let project = env["T3SHOT_DEMO_PROJECT"] ?? "acme-login-demo"
@@ -172,7 +186,9 @@ final class DemoScript {
         NSApp.activate(ignoringOtherApps: true)
         NSApp.presentationOptions = [.hideDock, .hideMenuBar]
         stage.makeKeyAndOrderFront(nil)
-        await sleep(1.2)
+        // 舞台就绪后才让录屏开始，避免拍到桌面上的其他窗口
+        if let ready = env["T3SHOT_DEMO_READY"] { FileManager.default.createFile(atPath: ready, contents: Data("ready".utf8)) }
+        await sleep(Double(env["T3SHOT_DEMO_LEAD"] ?? "3") ?? 3)
 
         await say("T3Shot：把截图批注投递进 T3，跨 MacBook / omarchy 两台机器")
         await sleep(2.6)
@@ -230,8 +246,8 @@ final class DemoScript {
         await say("点「打开线程」，在 T3 里看：新线程带着截图，follow-up 在队列里")
         await sleep(1.6)
         caption.hide()
-        NSApp.presentationOptions = []
-        c2.window.orderOut(nil); stage.orderOut(nil)
+        c2.window.orderOut(nil)
+        // 舞台留在后面当底，只让 T3 Code 的窗口浮上来
         if let l = r2?.link ?? firstLink { T3Open.open(l) }
         await sleep(Double(env["T3SHOT_DEMO_TAIL"] ?? "16") ?? 16)
         finish()
