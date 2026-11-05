@@ -1,0 +1,5 @@
+.DS_Store
+*.app
+*.mov
+*.mp4
+targets.json
