@@ -30,6 +30,21 @@ final class Agent: NSObject, NSApplicationDelegate {
             guard let img = NSImage(contentsOf: url) else { fputs("无法读取图片\n", stderr); exit(1) }
             let c = open(image: img)
             c.onClose = { NSApp.terminate(nil) }
+            // 自检钩子：按常驻模式的方式自动发送一次（窗口立刻收起、结果走提示），用于脚本验证
+            if let key = ProcessInfo.processInfo.environment["T3SHOT_AUTOSEND_KEY"] {
+                c.dismissOnSend = true
+                c.onClose = { DispatchQueue.main.asyncAfter(deadline: .now() + 10) { NSApp.terminate(nil) } }
+                Task { @MainActor in
+                    await Directory.shared.refresh()
+                    guard let d = Directory.shared.destinations.first(where: { $0.key == key }) else { fputs("找不到目标 \(key)\n", stderr); exit(3) }
+                    c.setDestination(d, remember: false)
+                    c.note.string = ProcessInfo.processInfo.environment["T3SHOT_NOTE"] ?? "T3Shot 自检"
+                    try? await Task.sleep(for: .seconds(1))
+                    fputs("SEND_AT=\(Date().timeIntervalSince1970)\n", stderr)
+                    c.send()
+                    fputs("WINDOW_VISIBLE_AFTER_SEND=\(c.window.isVisible)\n", stderr)
+                }
+            }
         case .demo:
             NSApp.setActivationPolicy(.regular)
             demo = DemoScript()
