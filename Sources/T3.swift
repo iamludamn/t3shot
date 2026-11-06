@@ -413,8 +413,9 @@ final class Directory {
             Destination(env: h, kind: .setupProject(projectModel: models[pid]), title: pname, project: pname, projectId: pid, updatedAt: nil)
         }
         // 线程：优先用 shell 快照（和 T3 侧边栏同一份数据），拿不到再用 MCP 列表
-        var threads = await Directory.sidebarThreads(h) ?? []
-        if h.httpToken == nil || threads.isEmpty {
+        let fromShell = await Directory.sidebarThreads(h)
+        var threads = fromShell ?? []
+        if fromShell == nil {
             threads = (try await c.call("t3_thread_list", ["allProjects": true, "settled": false, "snoozed": false, "includeSubagents": false, "limit": 60])["threads"] as? [[String: Any]]) ?? []
         }
         let follow: [Destination] = threads.compactMap { t in
