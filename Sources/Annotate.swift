@@ -359,7 +359,7 @@ final class AnnotateController: NSObject, NSWindowDelegate {
         if destination != nil, Directory.shared.loadedAt != nil, !all.contains(where: { $0.key == destination!.key }) { destination = nil }
         if destination == nil {
             let last = UserDefaults.standard.string(forKey: "lastDestination")
-            if let d = all.first(where: { $0.key == last }) ?? all.first(where: { $0.isNew }) ?? all.first { setDestination(d, remember: false); return }
+            if let d = all.first(where: { $0.key == last }) ?? all.first(where: { $0.isNew && !$0.needsSetup }) ?? all.first(where: { !$0.needsSetup }) ?? all.first { setDestination(d, remember: false); return }
         }
         if destination == nil { renderChip() }
     }
@@ -382,7 +382,12 @@ final class AnnotateController: NSObject, NSWindowDelegate {
         }
         sendBtn.isEnabled = !isSending
         let envShort = d.env.label.replacingOccurrences(of: "（本机）", with: "").replacingOccurrences(of: "（经链接）", with: "")
-        if d.isNew {
+        if d.needsSetup {
+            chip.image = UI.symbol("plus.circle.dashed", 13)
+            chip.title = "新线程 · \(d.title)（首次）"
+            sendBtn.title = "启用并新建"
+            hint("首次投递：先在 \(envShort) 的「\(d.project)」创建 scheduler webhook 入口，再新建线程")
+        } else if d.isNew {
             chip.image = UI.symbol("plus.bubble", 13)
             chip.title = "新线程 · \(d.title)"
             sendBtn.title = "新建线程"
@@ -432,7 +437,7 @@ final class AnnotateController: NSObject, NSWindowDelegate {
         UserDefaults.standard.set(d.key, forKey: "lastDestination")
         isSending = true; sendBtn.isEnabled = false; chip.isEnabled = false
         lastLink = nil; openBtn.isHidden = true
-        setStatus(d.isNew ? "上传截图、触发 webhook…" : "上传截图、投递到线程…")
+        setStatus(d.needsSetup ? "创建 webhook 入口、上传截图…" : d.isNew ? "上传截图、触发 webhook…" : "上传截图、投递到线程…")
         let text = note.string
         Task { @MainActor in
             do {

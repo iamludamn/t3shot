@@ -41,7 +41,8 @@ if has("--list") {
             print("[\(e.online ? "在线" : "离线")] \(e.label) \(e.id) \(e.direct ? "已配对" : "经链接")\(e.error.map { " · \($0)" } ?? "")")
         }
         for d in Directory.shared.destinations {
-            print("  \(d.isNew ? "新线程" : d.statusText.padding(toLength: 4, withPad: "　", startingAt: 0))  \(d.env.label) · \(d.title)  [\(d.key)]")
+            let kind = d.needsSetup ? "可启用" : d.isNew ? "新线程" : d.statusText.padding(toLength: 4, withPad: "　", startingAt: 0)
+            print("  \(kind)  \(d.env.label) · \(d.title)  [\(d.key)]")
         }
     }
 }

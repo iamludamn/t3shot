@@ -55,19 +55,21 @@ private final class RowView: NSView {
             NSLayoutConstraint.activate([a.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 44), a.centerYAnchor.constraint(equalTo: centerYAnchor)])
         case .dest(let d):
             let icon = NSImageView()
-            icon.image = d.isNew ? UI.symbol("plus.bubble", 14, .regular, colors: [.controlAccentColor])
+            icon.image = d.needsSetup ? UI.symbol("plus.circle.dashed", 14, .regular, colors: [.secondaryLabelColor])
+                       : d.isNew ? UI.symbol("plus.bubble", 14, .regular, colors: [.controlAccentColor])
                                  : UI.symbol("circle.fill", 8, colors: [d.isActive ? .systemGreen : .tertiaryLabelColor])
             icon.translatesAutoresizingMaskIntoConstraints = false
             let env = d.env.label
             let sub: String
             switch d.kind {
             case .newThread(_, let task): sub = "\(env) · webhook「\(task)」"
+            case .setupProject: sub = "\(env) · 还没有入口，选中后自动创建 webhook"
             case .thread:
                 let rel = d.updatedAt.map { Self.relative.localizedString(for: $0, relativeTo: Date()) } ?? ""
                 sub = [env, d.project, rel].filter { !$0.isEmpty }.joined(separator: " · ")
             }
             let title = label(d.title, 13, .medium), subtitle = label(sub, 11, .regular, .secondaryLabelColor)
-            let badgeText = d.isNew ? "新建" : (d.isActive ? "\(d.statusText) · 排队跟进" : "空闲")
+            let badgeText = d.needsSetup ? "启用" : d.isNew ? "新建" : (d.isActive ? "\(d.statusText) · 排队跟进" : "空闲")
             let badge = label(badgeText, 10, .semibold, d.isNew ? .controlAccentColor : (d.isActive ? .systemGreen : .tertiaryLabelColor))
             badge.setContentCompressionResistancePriority(.init(800), for: .horizontal)
             badge.setContentHuggingPriority(.init(800), for: .horizontal)
@@ -169,7 +171,7 @@ final class PickerController: NSObject, NSSearchFieldDelegate, NSPopoverDelegate
         let q = search.stringValue.trimmingCharacters(in: .whitespaces).lowercased()
         let match: (Destination) -> Bool = { d in q.isEmpty || [d.title, d.project, d.env.label].contains { $0.lowercased().contains(q) } }
         let all = Directory.shared.destinations.filter(match)
-        let news = all.filter { $0.isNew }
+        let news = all.filter { $0.isNew }.sorted { a, b in a.needsSetup != b.needsSetup ? !a.needsSetup : a.title < b.title }
         let threads = all.filter { !$0.isNew }.sorted { a, b in
             if a.isActive != b.isActive { return a.isActive }
             return (a.updatedAt ?? .distantPast) > (b.updatedAt ?? .distantPast)
@@ -180,7 +182,8 @@ final class PickerController: NSObject, NSSearchFieldDelegate, NSPopoverDelegate
             out.append(.header(title, sub))
             let open = !q.isEmpty || expanded.contains(i)
             // 收起时：agent 派生的线程不占名额（运行中的除外）
-            var shown = open ? items : Array(items.filter { !$0.byAgent || $0.isActive }.prefix(limit))
+            // 收起时：agent 派生的线程、还没有入口的项目都不占名额（运行中的线程除外）
+            var shown = open ? items : Array(items.filter { (!$0.byAgent || $0.isActive) && !$0.needsSetup }.prefix(limit))
             if !open, let c = current, !shown.contains(where: { $0.key == c.key }), let hit = items.first(where: { $0.key == c.key }) { shown.append(hit) }
             out += shown.map { .dest($0) }
             if items.count > shown.count { out.append(.more(section: i, hidden: items.count - shown.count)) }
