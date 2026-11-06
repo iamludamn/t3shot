@@ -170,6 +170,8 @@ final class AnnotateController: NSObject, NSWindowDelegate {
     var onClose: (() -> Void)?
     var onSent: ((DeliveryResult) -> Void)?
     var isSending = false
+    /// 常驻模式：按下发送窗口立刻收起，投递在后台进行，结果用右上角提示显示；失败时把窗口恢复。
+    var dismissOnSend = false
 
     init(image: NSImage) {
         canvas = Canvas(image: image)
@@ -439,6 +441,7 @@ final class AnnotateController: NSObject, NSWindowDelegate {
         lastLink = nil; openBtn.isHidden = true
         setStatus(d.needsSetup ? "创建 webhook 入口、上传截图…" : d.isNew ? "上传截图、触发 webhook…" : "上传截图、投递到线程…")
         let text = note.string
+        if dismissOnSend { return sendInBackground(d, text: text, png: png, name: name) }
         Task { @MainActor in
             do {
                 let r = try await Delivery.deliver(d, note: text, png: png, fileName: name)
@@ -452,6 +455,46 @@ final class AnnotateController: NSObject, NSWindowDelegate {
                 isSending = false; chip.isEnabled = true; sendBtn.isEnabled = true
                 setStatus("投递失败：\(error.localizedDescription)", error: true)
                 print("ERR: \(error.localizedDescription)")
+            }
+        }
+    }
+}
+
+extension AnnotateController {
+    /// 窗口立刻收起；投递、等线程创建都在后台，进度和结果走 Toast。失败时窗口原样回来，说明和批注都还在。
+    func sendInBackground(_ d: Destination, text: String, png: Data, name: String) {
+        window.orderOut(nil)
+        let envShort = d.env.label.replacingOccurrences(of: "（本机）", with: "").replacingOccurrences(of: "（经链接）", with: "")
+        let target = d.isNew ? "新线程 · \(d.project)" : "「\(d.title)」"
+        Toast.shared.show(.working, d.needsSetup ? "正在创建入口并投递…" : "正在投递…", detail: "\(target) · \(envShort)")
+        Task { @MainActor in
+            do {
+                let r = try await Delivery.deliver(d, note: text, png: png, fileName: name, waitForThread: false)
+                print("OK: \(r.message) \(r.link?.absoluteString ?? "")")
+                isSending = false
+                onSent?(r)
+                window.close()                    // 成功后才真正关掉窗口（之前只是隐藏）
+                Task { await Directory.shared.refresh() }
+                if let lookup = r.pendingLookup {
+                    // 新线程：先告诉已投递，线程建好后再换成可点击的提示
+                    Toast.shared.show(.ok, "已投递到「\(d.project)」", detail: "正在创建线程… · \(envShort)", hideAfter: 30)
+                    if let found = await lookup() {
+                        let link = found.0
+                        Toast.shared.show(.ok, "已新建线程「\(found.1)」", detail: "\(d.project) · \(envShort)", actionTitle: "打开") { T3Open.open(link) }
+                    } else {
+                        Toast.shared.show(.ok, "已投递到「\(d.project)」", detail: "线程还在创建，稍后在 T3 里查看 · \(envShort)")
+                    }
+                } else {
+                    let link = r.link
+                    Toast.shared.show(.ok, d.isActive ? "已排队为下一轮 follow-up" : "已发送，线程开始新一轮",
+                                      detail: "\(target) · \(envShort)", actionTitle: link == nil ? nil : "打开") { if let link { T3Open.open(link) } }
+                }
+            } catch {
+                print("ERR: \(error.localizedDescription)")
+                isSending = false; chip.isEnabled = true; sendBtn.isEnabled = true
+                setStatus("投递失败：\(error.localizedDescription)", error: true)
+                window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+                Toast.shared.show(.error, "投递失败，窗口已恢复", detail: error.localizedDescription, hideAfter: 8)
             }
         }
     }

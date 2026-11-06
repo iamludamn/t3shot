@@ -541,19 +541,38 @@ enum ProjectSetup {
 
 // MARK: - 投递
 
-struct DeliveryResult { let message: String; let link: URL?; var threadId: String? = nil }
+struct DeliveryResult {
+    let message: String
+    let link: URL?
+    var threadId: String? = nil
+    /// 不等线程创建就返回时（waitForThread: false），稍后用它去找刚建出来的线程：(链接, 标题, 线程 id)
+    var pendingLookup: (@Sendable () async -> (URL, String, String)?)? = nil
+}
 
 enum Delivery {
     /// 新线程：先把图传到项目所在机器（能传的话），再 POST 项目的 scheduler webhook；之后在该项目里找到刚建出来的线程。
     /// 跟进：活跃线程用 queue（下一轮 follow-up，不打断当前轮）；空闲线程直接发起新一轮，能带原生附件就带。
-    static func deliver(_ d: Destination, note: String, png: Data, fileName: String) async throws -> DeliveryResult {
+    /// 在项目里找 since 之后新建的线程（webhook 只回 deliveryId，线程要等 scheduler 跑起来才有）
+    static func findNewThread(_ d: Destination, since: Date, attempts: Int = 16) async -> (URL, String, String)? {
+        for _ in 0..<attempts {
+            try? await Task.sleep(for: .seconds(1.5))
+            if let ts = try? await d.env.client.call("t3_thread_list", ["projectId": d.projectId, "limit": 5])["threads"] as? [[String: Any]],
+               let t = ts.first(where: { (parseISO($0["createdAt"]) ?? .distantPast) >= since.addingTimeInterval(-3) }),
+               let tid = t["threadId"] as? String, let link = threadWebLink(env: d.env.id, thread: tid) {
+                return (link, t["title"] as? String ?? "新线程", tid)
+            }
+        }
+        return nil
+    }
+
+    static func deliver(_ d: Destination, note: String, png: Data, fileName: String, waitForThread: Bool = true) async throws -> DeliveryResult {
         if case .setupProject(let pm) = d.kind {
             let (url, setupNote) = try await ProjectSetup.ensureWebhook(d, projectModel: pm)
             let ready = Destination(env: d.env, kind: .newThread(webhook: url, taskTitle: ProjectSetup.taskTitle),
                                     title: d.title, project: d.project, projectId: d.projectId, updatedAt: nil)
-            var r = try await deliver(ready, note: note, png: png, fileName: fileName)
-            r = DeliveryResult(message: "已为「\(d.project)」创建 webhook 入口\(setupNote.isEmpty ? "" : "（\(setupNote)）") · " + r.message, link: r.link, threadId: r.threadId)
-            return r
+            let r = try await deliver(ready, note: note, png: png, fileName: fileName, waitForThread: waitForThread)
+            return DeliveryResult(message: "已为「\(d.project)」创建 webhook 入口\(setupNote.isEmpty ? "" : "（\(setupNote)）") · " + r.message,
+                                  link: r.link, threadId: r.threadId, pendingLookup: r.pendingLookup)
         }
         let host = Host.current().localizedName ?? "Mac"
         let started = Date()
@@ -579,17 +598,15 @@ enum Delivery {
             let (data, resp) = try await URLSession.shared.data(for: req)
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             guard (200..<300).contains(code) else { throw T3Error("webhook 返回 \(code)：\(String(data: data.prefix(120), encoding: .utf8) ?? "")") }
-            // webhook 只回 deliveryId；在项目里轮询刚创建的线程，拿到链接。
-            var link: URL?; var title: String?; var newId: String?
-            for _ in 0..<16 {
-                try? await Task.sleep(for: .seconds(1.5))
-                if let ts = try? await d.env.client.call("t3_thread_list", ["projectId": d.projectId, "limit": 5])["threads"] as? [[String: Any]],
-                   let t = ts.first(where: { (parseISO($0["createdAt"]) ?? .distantPast) >= started.addingTimeInterval(-3) }),
-                   let tid = t["threadId"] as? String {
-                    link = threadWebLink(env: d.env.id, thread: tid); title = t["title"] as? String; newId = tid; break
-                }
-            }
             let img = remotePath != nil ? "截图已作为附件送到 \(d.env.label)" : "图片未送达（\(uploadError ?? "")）"
+            if !waitForThread {
+                let dd = d
+                return DeliveryResult(message: "已投递到「\(d.project)」· \(img)", link: nil,
+                                      pendingLookup: { await Delivery.findNewThread(dd, since: started) })
+            }
+            // webhook 只回 deliveryId；在项目里轮询刚创建的线程，拿到链接。
+            let found = await findNewThread(d, since: started)
+            let link = found?.0, title = found?.1, newId = found?.2
             return DeliveryResult(message: title.map { "已新建线程「\($0)」· \(img)" } ?? "已投递到 webhook（HTTP \(code)），线程创建中 · \(img)", link: link, threadId: newId)
 
         case .setupProject:
