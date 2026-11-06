@@ -129,17 +129,7 @@ final class Agent: NSObject, NSApplicationDelegate {
         let c = AnnotateController(image: image)
         controllers.append(c)
         c.onClose = { [weak self, weak c] in self?.controllers.removeAll { $0 === c } }
-        c.onSent = { [weak c] _ in
-            // 常驻模式：投递成功后窗口停留 4 秒（可点「打开线程」）；鼠标还停在窗口上就不关。
-            guard case .resident = Agent.shared.mode else { return }
-            func later() {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
-                    guard let c else { return }
-                    if c.window.frame.contains(NSEvent.mouseLocation) { later() } else { c.window.performClose(nil) }
-                }
-            }
-            later()
-        }
+        if case .resident = mode { c.dismissOnSend = true }   // 发送即收起，结果走右上角提示
         c.show()
         return c
     }
