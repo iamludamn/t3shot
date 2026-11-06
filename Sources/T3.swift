@@ -112,6 +112,8 @@ struct EnvRecord: Codable {
     var token: String
     var expiresAt: Double      // epoch 秒
     var isLocal: Bool
+    /// 只读 HTTP 会话：读 T3 网页端用的 shell 快照（带 settledAt / delegatedFrom / lineage），让线程列表和侧边栏一致。旧记录没有
+    var httpToken: String? = nil
 }
 
 enum EnvStore {
@@ -148,7 +150,7 @@ enum EnvStore {
 
     /// 本机环境没配对或凭证 3 天内过期：用本机 t3 CLI 签发配对码，自动配对。
     static func ensureLocal() async throws -> EnvRecord? {
-        if let e = load().first(where: { $0.isLocal }), e.expiresAt - Date().timeIntervalSince1970 > 3 * 86400 { return e }
+        if let e = load().first(where: { $0.isLocal }), e.expiresAt - Date().timeIntervalSince1970 > 3 * 86400, e.httpToken != nil { return e }
         guard let origin = localOrigin(), let cli = localCLI() else { return nil }
         let out = try runProcess(cli, ["auth", "pairing", "create", "--ttl", "5m", "--label", "T3Shot", "--json"])
         guard let start = out.firstIndex(of: "{"),
@@ -193,6 +195,28 @@ enum Pairing {
             }
             return obj
         }
+        // ① 用配对码换一个 HTTP 会话：读 shell 快照，并用它再签发一个配对码给 MCP 授权用（一个码完成两步）
+        var httpToken: String?
+        var mcpCode = code
+        if let ex = try? await send("oauth/token", form: [
+            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange", "subject_token": code,
+            "subject_token_type": "urn:t3:params:oauth:token-type:environment-bootstrap",
+            "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
+            // 要签发第二个码，会话必须持有它授予的全部权限（MCP full-access 的四项）外加 access:write
+            "scope": "orchestration:read orchestration:operate settings:write source-control:write access:write",
+            "client_label": "T3Shot", "client_device_type": "bot"]),
+           let t = ex["access_token"] as? String {
+            httpToken = t
+            var req = URLRequest(url: base.appendingPathComponent("api/auth/pairing-token"), timeoutInterval: 20)
+            req.httpMethod = "POST"; req.httpBody = Data(#"{"label":"T3Shot MCP","scopes":["orchestration:read","orchestration:operate","settings:write","source-control:write"]}"#.utf8)
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization")
+            req.setValue(t3UserAgent, forHTTPHeaderField: "User-Agent")
+            if let res = try? await URLSession.shared.data(for: req),
+               let j = try? JSONSerialization.jsonObject(with: res.0) as? [String: Any], let c2 = j["credential"] as? String { mcpCode = c2 }
+            else { throw T3Error("换到了 HTTP 会话，但签发第二个配对码失败") }
+        }
+        // ② MCP OAuth
         let meta = try await send(".well-known/oauth-protected-resource/mcp")
         guard let resource = meta["resource"] as? String else { throw T3Error("这个地址不是 T3 Code 服务") }
         let host = Host.current().localizedName ?? "Mac"
@@ -202,7 +226,7 @@ enum Pairing {
         let challenge = sha256URLSafe(verifier)
         let auth: [String: Any] = ["response_type": "code", "client_id": clientId, "redirect_uri": redirect, "code_challenge": challenge,
                                    "code_challenge_method": "S256", "state": randomURLSafe(8), "resource": resource]
-        let decision = try await send("oauth/mcp/decision", json: ["authorization": auth, "decision": ["_tag": "pairing-code", "access": "full-access", "code": code]])
+        let decision = try await send("oauth/mcp/decision", json: ["authorization": auth, "decision": ["_tag": "pairing-code", "access": "full-access", "code": mcpCode]])
         guard let to = decision["redirectTo"] as? String, let comps = URLComponents(string: to),
               let authCode = comps.queryItems?.first(where: { $0.name == "code" })?.value else {
             throw T3Error("配对码被拒绝：\(URLComponents(string: decision["redirectTo"] as? String ?? "")?.queryItems?.first { $0.name == "error_description" }?.value ?? "未知原因")")
@@ -214,7 +238,7 @@ enum Pairing {
         let mcp = MCPClient(base: base, token: token)
         let info = try await mcp.call("t3_environment_read")
         return EnvRecord(id: info["environmentId"] as? String ?? UUID().uuidString, label: info["label"] as? String ?? base.host ?? "T3",
-                         url: base.absoluteString, token: token, expiresAt: Date().timeIntervalSince1970 + ttl, isLocal: false)
+                         url: base.absoluteString, token: token, expiresAt: Date().timeIntervalSince1970 + ttl, isLocal: false, httpToken: httpToken)
     }
 }
 
@@ -236,10 +260,13 @@ final class EnvHandle: @unchecked Sendable {
     let client: MCPClient
     let direct: Bool
     let isLocal: Bool
+    var base: URL?
+    var httpToken: String?
     var online = false
     var error: String?
-    init(id: String, label: String, client: MCPClient, direct: Bool, isLocal: Bool) {
+    init(id: String, label: String, client: MCPClient, direct: Bool, isLocal: Bool, base: URL? = nil, httpToken: String? = nil) {
         self.id = id; self.label = label; self.client = client; self.direct = direct; self.isLocal = isLocal
+        self.base = base; self.httpToken = httpToken
     }
 }
 
@@ -307,7 +334,7 @@ final class Directory {
             let local = try? await EnvStore.ensureLocal()
             for r in EnvStore.load() where r.expiresAt > Date().timeIntervalSince1970 {
                 guard let u = URL(string: r.url) else { continue }
-                handles.append(EnvHandle(id: r.id, label: r.isLocal ? "\(r.label)（本机）" : r.label, client: MCPClient(base: u, token: r.token), direct: true, isLocal: r.isLocal))
+                handles.append(EnvHandle(id: r.id, label: r.isLocal ? "\(r.label)（本机）" : r.label, client: MCPClient(base: u, token: r.token), direct: true, isLocal: r.isLocal, base: u, httpToken: r.httpToken))
             }
             // 已链接到本机、但 T3Shot 没有直接凭证的环境：经本机 T3 的 link 转发。
             if let local, let u = URL(string: local.url) {
@@ -386,7 +413,12 @@ final class Directory {
         let setups: [Destination] = names.filter { !hooked.contains($0.key) }.sorted { $0.value < $1.value }.map { pid, pname in
             Destination(env: h, kind: .setupProject(projectModel: models[pid]), title: pname, project: pname, projectId: pid, updatedAt: nil)
         }
-        let threads = (try await c.call("t3_thread_list", ["allProjects": true, "settled": false, "snoozed": false, "includeSubagents": false, "limit": 60])["threads"] as? [[String: Any]]) ?? []
+        // 线程：优先用 shell 快照（和 T3 侧边栏同一份数据），拿不到再用 MCP 列表
+        let fromShell = await Directory.sidebarThreads(h)
+        var threads = fromShell ?? []
+        if fromShell == nil {
+            threads = (try await c.call("t3_thread_list", ["allProjects": true, "settled": false, "snoozed": false, "includeSubagents": false, "limit": 60])["threads"] as? [[String: Any]]) ?? []
+        }
         let follow: [Destination] = threads.compactMap { t in
             guard let id = t["threadId"] as? String, t["parentThreadId"] is NSNull || t["parentThreadId"] == nil else { return nil }
             let pid = t["projectId"] as? String ?? ""
@@ -396,6 +428,34 @@ final class Directory {
             return d
         }
         return hooks + setups + follow
+    }
+}
+
+extension Directory {
+    /// 读 T3 网页端用的 shell 快照，只留侧边栏里「工作中」和「空闲」的线程：
+    /// 未 settle（settledAt 为空）、未归档/删除、未 snooze、不是子线程（lineage.parentThreadId）、
+    /// 也不是别的环境派过来的子任务（delegatedFrom，侧边栏把它收在父线程下面）。
+    /// 转成和 t3_thread_list 一样的字段，后面的代码不用区分来源。
+    nonisolated static func sidebarThreads(_ h: EnvHandle) async -> [[String: Any]]? {
+        guard let base = h.base, let tok = h.httpToken,
+              var comps = URLComponents(url: base.appendingPathComponent("api/orchestration/shell"), resolvingAgainstBaseURL: false) else { return nil }
+        comps.queryItems = [URLQueryItem(name: "omitOlderSettled", value: "true"), URLQueryItem(name: "omitIdleSubagents", value: "true")]
+        var req = URLRequest(url: comps.url!, timeoutInterval: 25)
+        req.setValue("Bearer \(tok)", forHTTPHeaderField: "Authorization")
+        req.setValue("2", forHTTPHeaderField: "x-t3-orchestration-protocol")
+        req.setValue(t3UserAgent, forHTTPHeaderField: "User-Agent")
+        guard let res = try? await URLSession.shared.data(for: req), (res.1 as? HTTPURLResponse)?.statusCode == 200,
+              let j = try? JSONSerialization.jsonObject(with: res.0) as? [String: Any], let ts = j["threads"] as? [[String: Any]] else { return nil }
+        let now = Date()
+        func isNull(_ v: Any?) -> Bool { v == nil || v is NSNull }
+        return ts.compactMap { t in
+            guard isNull(t["settledAt"]), isNull(t["archivedAt"]), isNull(t["deletedAt"]), isNull(t["delegatedFrom"]),
+                  isNull((t["lineage"] as? [String: Any])?["parentThreadId"]) else { return nil }
+            if let until = parseISO(t["snoozedUntil"]), until > now { return nil }
+            return ["threadId": t["id"] ?? "", "title": t["title"] ?? "", "status": t["status"] ?? "idle", "projectId": t["projectId"] ?? "",
+                    "updatedAt": t["updatedAt"] ?? "", "createdBy": t["createdBy"] ?? "", "creationSource": t["creationSource"] ?? "",
+                    "model": (t["modelSelection"] as? [String: Any])?["model"] ?? "", "providerInstanceId": t["providerInstanceId"] ?? ""]
+        }.sorted { (parseISO($0["updatedAt"]) ?? .distantPast) > (parseISO($1["updatedAt"]) ?? .distantPast) }
     }
 }
 
