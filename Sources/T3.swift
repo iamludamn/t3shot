@@ -202,12 +202,13 @@ enum Pairing {
             "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange", "subject_token": code,
             "subject_token_type": "urn:t3:params:oauth:token-type:environment-bootstrap",
             "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
-            "scope": "orchestration:read orchestration:operate access:write",
+            // 要签发第二个码，会话必须持有它授予的全部权限（MCP full-access 的四项）外加 access:write
+            "scope": "orchestration:read orchestration:operate settings:write source-control:write access:write",
             "client_label": "T3Shot", "client_device_type": "bot"]),
            let t = ex["access_token"] as? String {
             httpToken = t
             var req = URLRequest(url: base.appendingPathComponent("api/auth/pairing-token"), timeoutInterval: 20)
-            req.httpMethod = "POST"; req.httpBody = Data(#"{"label":"T3Shot MCP"}"#.utf8)
+            req.httpMethod = "POST"; req.httpBody = Data(#"{"label":"T3Shot MCP","scopes":["orchestration:read","orchestration:operate","settings:write","source-control:write"]}"#.utf8)
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization")
             req.setValue(t3UserAgent, forHTTPHeaderField: "User-Agent")
