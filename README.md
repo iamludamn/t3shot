@@ -59,9 +59,22 @@ T3Shot --pair https://prod-xxxx.t3coderelay.com <配对码>
 
 快捷键：⌃⇧4 截图，⌘K 选目标（↑↓ 选择，↩ 确认），⌘↵ 发送，⌘Z 撤销批注。
 
-## 项目里配套的 webhook 任务
+## 项目的 webhook 入口：自动创建
 
-T3Shot 自动发现：每个项目里**启用的、每次新建线程（不绑定线程）、不要求签名**的 webhook 定时任务，都会成为一个「新线程」入口。prompt 里可以用这些占位符：
+T3Shot 把每个项目里**启用的、每次新建线程（不绑定线程）、不要求签名**的 webhook 定时任务当作「新线程」入口。
+
+还没有入口的项目收在选择器第 2 层，标「启用」。选中后第一次投递时，T3Shot 会自动完成：
+
+1. **补默认模型**：`schedule_task` 只认项目记录里的默认模型，所以先按 T3 界面新建线程时的顺序找：
+   - 项目记录里的默认模型；
+   - T3 界面里给这个项目设的默认模型（`settings.json` 的 `projectSettingsOverrides`）；
+   - 环境默认模型（`settings.json` 的 `defaultModelSelection`）。
+
+   后两层 MCP 读不到。本机直接读文件；远端退一步用该项目、再到该环境最近线程实际用的模型。找到后用 `t3_project_update` 写回项目记录，项目的实际行为不变。
+2. **建任务**：用 `schedule_task` 建一个名为「T3Shot 截图批注」的 webhook 任务，使用统一的 prompt 模板。项目里已有同名任务就复用，不重复创建。
+3. **投递**：照常投递，之后这个项目就是普通的「新线程」目标。
+
+手动建的任务也可以，prompt 里能用这些占位符：
 
 `{{body.note}}`、`{{body.image_delivered}}`、`{{body.image_remote_path}}`（目标机器上的截图路径，`~/.t3/userdata/attachments/<id>.png`）、`{{body.image_attachment_id}}`、`{{body.host}}`、`{{body.created_at}}`、`{{body.environment}}`。
 
