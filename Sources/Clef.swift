@@ -58,7 +58,8 @@ enum Clef {
         guard let t = j["token"], !t.isEmpty else { return nil }
         return Creds(accountId: a, token: t, useWrangler: false)
     }
-    static var isConfigured: Bool { creds != nil }
+    /// T3SHOT_NO_CLEF=1 临时关掉（对比耗时、排查问题用）
+    static var isConfigured: Bool { getenv("T3SHOT_NO_CLEF") == nil && creds != nil }
 
     static func saveCreds(accountId: String, token: String?) throws {
         let dir = (credsPath as NSString).deletingLastPathComponent
@@ -211,14 +212,23 @@ enum Clef {
 
     static func prepareImage(_ png: Data) -> String? {
         guard let src = CGImageSourceCreateWithData(png as CFData, nil), let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return nil }
+        return prepareImage(img)
+    }
+
+    /// 缩到长边 ≤ 1568 再编码 JPEG。窗口里的整屏截图已经是 Canvas 直接渲染好的小图，这里通常不用再缩
+    static func prepareImage(_ img: CGImage) -> String? {
         let w = Double(img.width), h = Double(img.height)
         let scale = min(1.0, 1568 / max(w, h))
         let nw = max(1, Int(w * scale)), nh = max(1, Int(h * scale))
-        guard let ctx = CGContext(data: nil, width: nw, height: nh, bitsPerComponent: 8, bytesPerRow: 0,
-                                  space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
-        ctx.interpolationQuality = .high
-        ctx.draw(img, in: CGRect(x: 0, y: 0, width: nw, height: nh))
-        guard let out = ctx.makeImage() else { return nil }
+        var out = img
+        if scale < 1 {
+            guard let ctx = CGContext(data: nil, width: nw, height: nh, bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
+            ctx.interpolationQuality = .high
+            ctx.draw(img, in: CGRect(x: 0, y: 0, width: nw, height: nh))
+            guard let scaled = ctx.makeImage() else { return nil }
+            out = scaled
+        }
         let data = NSMutableData()
         guard let dst = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil) else { return nil }
         CGImageDestinationAddImage(dst, out, [kCGImageDestinationLossyCompressionQuality: 0.85] as CFDictionary)
@@ -243,8 +253,15 @@ enum Clef {
     nonisolated(unsafe) static var digestProvider: (@Sendable (Destination) async -> String?)? = nil
 
     static func rank(png: Data, note: String, candidates: [Destination]) async throws -> ClefResult {
+        guard let src = CGImageSourceCreateWithData(png as CFData, nil), let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+            throw T3Error("截图无法转成 Clef 接受的格式")
+        }
+        return try await rank(image: img, note: note, candidates: candidates)
+    }
+
+    static func rank(image: CGImage, note: String, candidates: [Destination]) async throws -> ClefResult {
         guard let creds else { throw T3Error("没有配置 Cloudflare 凭证") }
-        guard let b64 = prepareImage(png) else { throw T3Error("截图无法转成 Clef 接受的格式") }
+        guard let b64 = prepareImage(image) else { throw T3Error("截图无法转成 Clef 接受的格式") }
         guard !candidates.isEmpty else { throw T3Error("没有候选目标") }
         // 先把线程摘要凑齐（命中缓存很快；没命中的最多等几秒）
         var digests: [String: String] = [:]

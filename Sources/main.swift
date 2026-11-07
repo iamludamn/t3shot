@@ -9,6 +9,8 @@
 //   T3Shot --send <目标> --image 文件 [--note 说明]   无界面投递（<目标> 是 --list 里的 key 或标题片段）
 //   T3Shot --cf-auth <账号 ID>     从标准输入读 Cloudflare API token，存到 ~/.config/t3shot/cloudflare.json（0600），启用 Clef 看图判断目标
 //   T3Shot --cf-wrangler <账号 ID> 用 wrangler 的 OAuth 登录态（自动续期，免建 API token）
+//   T3Shot --bench-capture        三种整屏截图方式的耗时对比（sck / cli-tiff / cli-png）
+//   T3Shot --bench-open [N]       模拟按 N 次快捷键，打印 触发→截屏→窗口创建→窗口显示→首帧 的时间线（不投递）
 //   T3Shot --permissions          只读检查「输入监控」「屏幕录制」权限状态（不弹窗）
 //   T3Shot --selftest             离线自检（桩掉 Cloudflare 和 T3），全部通过退出码 0
 //   T3Shot --rank 图片 [--note 说明]   用 Clef 给图片判断目标，打印候选概率排序（不投递）
@@ -63,6 +65,29 @@ if let target = take("--send") {
         print("→ \(d.isNew ? "新线程" : d.statusText) · \(d.env.label) · \(d.title)")
         let r = try await Delivery.deliver(d, note: note, png: png, fileName: (image as NSString).lastPathComponent)
         print("OK: \(r.message)"); if let l = r.link { print("LINK: \(l.absoluteString)") }
+    }
+}
+
+if has("--bench-capture") {
+    // 三种整屏截图方式的耗时对比：每种 N 次，第 1 次单列（含预热）。不需要窗口，不投递。
+    let n = max(2, Int(take("--runs") ?? "") ?? 6)
+    _ = NSApplication.shared
+    runCLI {
+        guard let screen = NSScreen.main else { throw T3Error("没有屏幕") }
+        print("屏幕 \(Int(screen.frame.width))×\(Int(screen.frame.height)) pt，缩放 \(Int(screen.backingScaleFactor))x")
+        for m in ScreenGrabber.Method.allCases {
+            var times: [Double] = []; var px = ""
+            for _ in 0..<n {
+                let t = Date()
+                guard let img = await ScreenGrabber.grab(screen, method: m) else { print("\(m.rawValue)：失败（权限？）"); break }
+                // 到「能画」为止：把像素真正读一遍，和窗口里首次绘制的代价对齐
+                _ = img.dataProvider?.data
+                times.append(Date().timeIntervalSince(t) * 1000); px = "\(img.width)×\(img.height) px"
+            }
+            guard times.count == n else { continue }
+            let rest = times.dropFirst().sorted()
+            print(String(format: "%-9@ 首次 %5.0f ms · 之后 中位 %5.0f ms  最小 %5.0f  最大 %5.0f · %@", m.rawValue as NSString, times[0], rest[rest.count / 2], rest[0], rest[rest.count - 1], px as NSString))
+        }
     }
 }
 
@@ -127,6 +152,7 @@ if has("--install-agent") {
 let mode: Agent.Mode
 if has("--demo") { mode = .demo }
 else if has("--fullscreen") { mode = .fullscreen }
+else if let n = take("--bench-open") { mode = .benchOpen(max(1, Int(n) ?? 5)) }
 else if let image = take("--image") { mode = .single(URL(fileURLWithPath: image)) }
 else if args.isEmpty { mode = .resident }
 else { fputs("未知参数 \(args.joined(separator: " "))\n", stderr); exit(64) }

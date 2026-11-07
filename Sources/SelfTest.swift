@@ -73,6 +73,7 @@ enum SelfTest {
         Clef.session = stubSession()
         redaction()
         images()
+        await rendering()
         candidates()
         toml()
         preselect()
@@ -129,6 +130,47 @@ enum SelfTest {
                   "\(w)×\(h) → \(img.width)×\(img.height)，\(data.count / 1024) KiB", "ratioKept=\(ratioKept)")
         }
         check(Clef.prepareImage(Data([1, 2, 3])) == nil, "损坏的图片返回 nil 而不是崩溃")
+    }
+
+    // MARK: 2b 给 Clef 看的渲染（不经过 PNG 编码）
+
+    static func solid(_ w: Int, _ h: Int) -> NSImage {
+        let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                   isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        NSColor(calibratedRed: 0.1, green: 0.2, blue: 0.9, alpha: 1).setFill(); NSBezierPath(rect: NSRect(x: 0, y: 0, width: w, height: h)).fill()
+        NSGraphicsContext.restoreGraphicsState()
+        let img = NSImage(size: NSSize(width: w, height: h)); img.addRepresentation(rep)
+        return img
+    }
+
+    static func redPixels(_ img: CGImage) -> Int {
+        guard let data = img.dataProvider?.data, let p = CFDataGetBytePtr(data) else { return -1 }
+        let bpp = img.bitsPerPixel / 8, bpr = img.bytesPerRow
+        var n = 0
+        for y in 0..<img.height { for x in 0..<img.width {
+            let o = y * bpr + x * bpp
+            if p[o] > 200 && p[o + 1] < 90 && p[o + 2] < 90 { n += 1 }
+        } }
+        return n
+    }
+
+    static func rendering() async {
+        group("Canvas.renderCGImage（Clef 用的缩小渲染，替代整屏 PNG 编码）")
+        let cv = await MainActor.run { Canvas(image: solid(3000, 1800)) }
+        let plain = await MainActor.run { cv.renderCGImage(maxSide: 1568) }
+        check(plain.map { max($0.width, $0.height) == 1568 && abs(Double($0.width) / Double($0.height) - 3000.0 / 1800.0) < 0.02 } == true, "长边缩到 1568，比例不变", plain.map { "\($0.width)×\($0.height)" } ?? "nil")
+        check(plain.map { redPixels($0) == 0 } == true, "没有批注时没有红色像素")
+        let marked = await MainActor.run { () -> CGImage? in cv.marks = [.rect(CGRect(x: 300, y: 300, width: 2000, height: 900))]; return cv.renderCGImage(maxSide: 1568) }
+        check(marked.map { redPixels($0) > 200 } == true, "红框画进了渲染结果", marked.map { "红色像素 \(redPixels($0))" } ?? "nil")
+        let small = await MainActor.run { Canvas(image: solid(800, 400)).renderCGImage(maxSide: 1568) }
+        check(small.map { $0.width == 800 && $0.height == 400 } == true, "小图不放大", small.map { "\($0.width)×\($0.height)" } ?? "nil")
+        if let m = marked, let b64 = Clef.prepareImage(m), let d = Data(base64Encoded: b64) { check(d.starts(with: [0xFF, 0xD8]), "渲染结果能直接编成 JPEG（\(d.count / 1024) KiB）") } else { check(false, "渲染结果能直接编成 JPEG") }
+        if let scr = NSScreen.main, let img = marked ?? plain {
+            let nsimg = ScreenGrabber.nsImage(img, screen: scr)
+            check(nsimg.representations.first.map { $0.pixelsWide == img.width } == true, "NSImage 的 representation 保留真实像素数（Canvas 按它算导出尺寸）")
+        } else { print("  - 跳过：没有屏幕（非图形会话）") }
     }
 
     // MARK: 3 候选筛选

@@ -7,7 +7,7 @@ OUT="$HOME/Applications"; INSTALL=0
 for a in "$@"; do case "$a" in --install) INSTALL=1;; *) OUT="$a";; esac; done
 APP="$OUT/T3Shot.app"
 mkdir -p "$APP/Contents/MacOS"
-swiftc -O -o "$APP/Contents/MacOS/T3Shot" Sources/*.swift -framework AppKit -framework Carbon
+swiftc -O -o "$APP/Contents/MacOS/T3Shot" Sources/*.swift -framework AppKit -framework Carbon -framework ScreenCaptureKit
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

@@ -120,6 +120,7 @@ final class PickerController: NSObject, NSSearchFieldDelegate, NSPopoverDelegate
     private let current: Destination?
     private let onPick: (Destination) -> Void
     private var suggestions: [ClefSuggestion]
+    private var observerToken: UUID?
     private let width: CGFloat = 420
     var isShown: Bool { popover.isShown }
 
@@ -156,7 +157,7 @@ final class PickerController: NSObject, NSSearchFieldDelegate, NSPopoverDelegate
         popover.contentViewController = vc
         popover.behavior = .transient
         popover.delegate = self
-        Directory.shared.onChange.append { [weak self] in self?.rebuild() }
+        observerToken = Directory.shared.observe { [weak self] in self?.rebuild() }
         rebuild()
     }
 
@@ -168,7 +169,10 @@ final class PickerController: NSObject, NSSearchFieldDelegate, NSPopoverDelegate
         scroll.contentView.scroll(to: .zero); scroll.reflectScrolledClipView(scroll.contentView)
         if let s = selected, s < views.count { doc.scrollToVisible(views[s].frame.insetBy(dx: 0, dy: -8)) }
     }
-    func close() { popover.close() }
+    func close() { popover.close(); detach() }
+    func popoverDidClose(_ notification: Notification) { detach() }
+    /// 选择器每次打开都会新建一个：关闭时把目录观察者摘掉，别在常驻进程里越攒越多
+    private func detach() { if let t = observerToken { Directory.shared.unobserve(t); observerToken = nil } }
     /// 父窗口被提到较高层级时，弹出层跟着提上去
     func raise() { vc.view.window?.level = .popUpMenu }
 

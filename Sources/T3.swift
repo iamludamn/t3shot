@@ -325,7 +325,10 @@ final class Directory {
     private(set) var destinations: [Destination] = []
     private(set) var loadedAt: Date?
     private var inflight: Task<Void, Never>?
-    var onChange: [() -> Void] = []
+    private var observers: [UUID: () -> Void] = [:]
+    /// 目录刷新后的回调。返回 token，不再需要时 unobserve（窗口关闭时），否则常驻进程里会一直累积
+    func observe(_ f: @escaping () -> Void) -> UUID { let id = UUID(); observers[id] = f; return id }
+    func unobserve(_ id: UUID) { observers[id] = nil }
 
     /// 并发刷新所有环境：项目、带 webhook 的 scheduler 任务、未 settle 的线程。
     func refresh() async {
@@ -369,7 +372,7 @@ final class Directory {
                 dests += r.dests
             }
             envs = handles; destinations = dests; loadedAt = Date()
-            onChange.forEach { $0() }
+            observers.values.forEach { $0() }
             Task.detached { await Clef.prefetch(dests) }      // 后台预读线程摘要，按下快捷键时 Clef 判断更快
         }
         inflight = t

@@ -55,6 +55,7 @@ final class Canvas: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
+        if Perf.awaitFirstFrame { Perf.awaitFirstFrame = false; Perf.mark("first-frame") }
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         Canvas.backdrop.setFill(); bounds.fill()
         let imgRect = CGRect(x: origin.x, y: origin.y, width: iw * scale, height: ih * scale)
@@ -91,6 +92,22 @@ final class Canvas: NSView {
 
     func undo() { if !marks.isEmpty { marks.removeLast(); needsDisplay = true } }
     func clear() { marks.removeAll(); needsDisplay = true }
+
+    /// 把图片和批注直接渲染成一张缩小的 CGImage（长边 ≤ maxSide），不经过 PNG 编码。给 Clef 看图用：
+    /// 整屏 Retina 截图原尺寸编码一次 PNG 要几百毫秒，而 Clef 只要 1568 的长边。
+    func renderCGImage(maxSide: Int) -> CGImage? {
+        let s = min(1.0, Double(maxSide) / Double(max(iw, ih)))
+        let w = max(1, Int(Double(iw) * s)), h = max(1, Int(Double(ih) * s))
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.interpolationQuality = .high
+        ctx.scaleBy(x: s, y: s)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
+        drawContent()
+        NSGraphicsContext.restoreGraphicsState()
+        return ctx.makeImage()
+    }
 
     func exportPNG() -> Data? {
         guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(iw), pixelsHigh: Int(ih), bitsPerSample: 8,
@@ -180,6 +197,8 @@ final class AnnotateController: NSObject, NSWindowDelegate {
     private var clefTask: Task<Void, Never>?
     private var clefDebounce: DispatchWorkItem?
     private var clefAsked = false
+    private var clefScheduled = false
+    private var dirToken: UUID?
 
     /// 窗口出现和按比例定大小所在的屏幕（整屏截图时是鼠标所在的那块）；nil 用主屏
     let targetScreen: NSScreen?
@@ -191,7 +210,7 @@ final class AnnotateController: NSObject, NSWindowDelegate {
         super.init()
         build()
         note.onChange = { [weak self] in self?.noteChanged() }
-        Directory.shared.onChange.append { [weak self] in self?.directoryChanged() }
+        dirToken = Directory.shared.observe { [weak self] in self?.directoryChanged() }
         directoryChanged()
         if Directory.shared.loadedAt == nil || Date().timeIntervalSince(Directory.shared.loadedAt!) > 20 {
             Task { await Directory.shared.refresh() }
@@ -206,6 +225,7 @@ final class AnnotateController: NSObject, NSWindowDelegate {
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(note)
         NSApp.activate(ignoringOtherApps: true)
+        Perf.mark("window-shown")
     }
 
     // MARK: 布局
@@ -369,12 +389,16 @@ final class AnnotateController: NSObject, NSWindowDelegate {
         }
     }
 
-    func windowWillClose(_ n: Notification) { picker?.close(); onClose?() }
+    func windowWillClose(_ n: Notification) {
+        picker?.close()
+        if let t = dirToken { Directory.shared.unobserve(t); dirToken = nil }
+        onClose?()
+    }
 
     // MARK: 目标
 
     private func directoryChanged() {
-        defer { if !clefAsked, Directory.shared.loadedAt != nil { askClef() } }
+        defer { scheduleClef() }
         let all = Directory.shared.destinations
         if let d = destination, let fresh = all.first(where: { $0.key == d.key }) { setDestination(fresh, remember: false); return }
         if destination != nil, Directory.shared.loadedAt != nil, !all.contains(where: { $0.key == destination!.key }) { destination = nil }
@@ -550,17 +574,29 @@ extension AnnotateController {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: w)
     }
 
+    /// 窗口先出来，再去准备图片和发请求：延后 0.3 秒，不和首帧抢主线程（以前在 init 里同步导出整屏 PNG，窗口要等它）
+    func scheduleClef() {
+        guard Clef.isConfigured, !clefAsked, !clefScheduled, Directory.shared.loadedAt != nil else { return }
+        clefScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self else { return }
+            self.clefScheduled = false
+            if !self.clefAsked { self.askClef() }
+        }
+    }
+
     func askClef() {
         guard Clef.isConfigured, !isSending else { return }
         clefAsked = true
         let cands = Clef.candidates(from: Directory.shared.destinations)
-        guard !cands.isEmpty, let png = canvas.exportPNG() else { return }
+        guard !cands.isEmpty, let img = canvas.renderCGImage(maxSide: 1568) else { return }
         let text = note.string
         clefTask?.cancel()
         clefLine = "✨ Clef 正在看图判断…"; renderChip()
+        Perf.mark("clef-asked")
         clefTask = Task { @MainActor in
             do {
-                let r = try await Clef.rank(png: png, note: text, candidates: cands)
+                let r = try await Clef.rank(image: img, note: text, candidates: cands)
                 if Task.isCancelled { return }
                 applyClef(r)
             } catch {
