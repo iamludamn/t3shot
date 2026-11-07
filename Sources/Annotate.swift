@@ -97,7 +97,7 @@ final class Canvas: NSView {
     /// 整屏 Retina 截图原尺寸编码一次 PNG 要几百毫秒，而 Clef 只要 1568 的长边。
     func renderCGImage(maxSide: Int) -> CGImage? {
         let s = min(1.0, Double(maxSide) / Double(max(iw, ih)))
-        let w = max(1, Int(Double(iw) * s)), h = max(1, Int(Double(ih) * s))
+        let w = max(1, Int((Double(iw) * s).rounded())), h = max(1, Int((Double(ih) * s).rounded()))
         guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
                                   space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
         ctx.interpolationQuality = .high
