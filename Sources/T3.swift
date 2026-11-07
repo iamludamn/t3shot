@@ -487,7 +487,17 @@ extension Directory {
 // MARK: - 自动创建项目的 webhook 入口
 
 enum ProjectSetup {
-    static let taskTitle = "T3Shot 截图批注"
+    static let taskTitle = "截图投递"
+    /// 旧版本建的任务叫这个名字：复用时一并改成新名字
+    static let legacyTaskTitles = ["T3Shot 截图批注"]
+
+    /// 新线程的标题：直接用用户的批注（第一行，压成一行，超长截断）；没写批注就用任务名。
+    static func threadTitle(for note: String) -> String {
+        let line = note.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.first { !$0.isEmpty } ?? ""
+        let flat = line.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        guard !flat.isEmpty else { return taskTitle }
+        return flat.count > 40 ? String(flat.prefix(40)) + "…" : flat
+    }
     /// 只告诉 agent 有一张截图、在哪、批注是什么。图片一定已经送达（投递前校验），所以不需要任何"没送达"的分支。
     static let prompt = """
     用户上传了一张截图，路径：{{body.image_remote_path}}
@@ -538,7 +548,7 @@ enum ProjectSetup {
         let tasks = (try await c.call("list_scheduled_tasks", ["projectId": d.projectId])["tasks"] as? [[String: Any]]) ?? []
         var args: [String: Any] = ["projectId": d.projectId, "title": taskTitle, "prompt": prompt, "enabled": true,
                                    "bindToCurrentThread": false, "schedule": ["type": "webhook"]]
-        if let old = tasks.first(where: { ($0["title"] as? String) == taskTitle && ($0["schedule"] as? [String: Any])?["type"] as? String == "webhook"
+        if let old = tasks.first(where: { ([taskTitle] + legacyTaskTitles).contains($0["title"] as? String ?? "") && ($0["schedule"] as? [String: Any])?["type"] as? String == "webhook"
                                           && ($0["webhookSignature"] as? String ?? "none") == "none" }),
            let id = old["scheduledTaskId"] as? String {
             args["scheduledTaskId"] = id  // 连同 prompt 一起更新，让之前建的旧长模板也换成精简版
@@ -567,13 +577,17 @@ enum Delivery {
     /// 新线程：先把图传到项目所在机器（能传的话），再 POST 项目的 scheduler webhook；之后在该项目里找到刚建出来的线程。
     /// 跟进：活跃线程用 queue（下一轮 follow-up，不打断当前轮）；空闲线程直接发起新一轮，能带原生附件就带。
     /// 在项目里找 since 之后新建的线程（webhook 只回 deliveryId，线程要等 scheduler 跑起来才有）
-    static func findNewThread(_ d: Destination, since: Date, attempts: Int = 16) async -> (URL, String, String)? {
+    static func findNewThread(_ d: Destination, since: Date, rename: String? = nil, attempts: Int = 16) async -> (URL, String, String)? {
         for _ in 0..<attempts {
             try? await Task.sleep(for: .seconds(1.5))
             if let ts = try? await d.env.client.call("t3_thread_list", ["projectId": d.projectId, "limit": 5])["threads"] as? [[String: Any]],
                let t = ts.first(where: { (parseISO($0["createdAt"]) ?? .distantPast) >= since.addingTimeInterval(-3) }),
                let tid = t["threadId"] as? String, let link = threadWebLink(env: d.env.id, thread: tid) {
-                return (link, t["title"] as? String ?? "新线程", tid)
+                var title = t["title"] as? String ?? "新线程"
+                // 线程默认叫任务名；改成用户的批注。改名失败不影响投递，保留原标题
+                if let new = rename, new != title,
+                   (try? await d.env.client.call("t3_thread_update", ["threadId": tid, "action": "rename", "title": new])) != nil { title = new }
+                return (link, title, tid)
             }
         }
         return nil
@@ -590,6 +604,7 @@ enum Delivery {
         }
         let host = Host.current().localizedName ?? "Mac"
         let started = Date()
+        let renamedTitle = ProjectSetup.threadTitle(for: note)
         // 截图必须送达，否则整次投递失败：宁可让用户重试，也不发一条没有图的批注。
         guard d.env.direct else {
             throw T3Error("「\(d.env.label)」还没有与 T3Shot 配对，图片传不过去，已取消发送。请先配对该环境（T3Shot --pair）。")
@@ -616,10 +631,10 @@ enum Delivery {
             if !waitForThread {
                 let dd = d
                 return DeliveryResult(message: "已投递到「\(d.project)」· \(img)", link: nil,
-                                      pendingLookup: { await Delivery.findNewThread(dd, since: started) })
+                                      pendingLookup: { await Delivery.findNewThread(dd, since: started, rename: renamedTitle) })
             }
             // webhook 只回 deliveryId；在项目里轮询刚创建的线程，拿到链接。
-            let found = await findNewThread(d, since: started)
+            let found = await findNewThread(d, since: started, rename: renamedTitle)
             let link = found?.0, title = found?.1, newId = found?.2
             return DeliveryResult(message: title.map { "已新建线程「\($0)」· \(img)" } ?? "已投递到 webhook（HTTP \(code)），线程创建中 · \(img)", link: link, threadId: newId)
 

@@ -9,7 +9,7 @@ final class Canvas: NSView {
     let image: NSImage
     let iw: CGFloat, ih: CGFloat
     var marks: [Mark] = []
-    var tool = 0                    // 0 画笔 1 矩形
+    var tool = 0                    // 0 矩形（默认）1 画笔（手动切换）
     var current: Mark?
     private var startPt = CGPoint.zero
 
@@ -79,12 +79,12 @@ final class Canvas: NSView {
     override func resetCursorRects() { addCursorRect(bounds, cursor: .crosshair) }
     override func mouseDown(with e: NSEvent) {
         startPt = imagePoint(e)
-        current = tool == 0 ? .pen([startPt]) : .rect(CGRect(origin: startPt, size: .zero))
+        current = tool == 1 ? .pen([startPt]) : .rect(CGRect(origin: startPt, size: .zero))
         needsDisplay = true
     }
     override func mouseDragged(with e: NSEvent) {
         let p = imagePoint(e)
-        if tool == 0, case .pen(var pts)? = current { pts.append(p); current = .pen(pts) }
+        if tool == 1, case .pen(var pts)? = current { pts.append(p); current = .pen(pts) }
         else { current = .rect(CGRect(x: min(startPt.x, p.x), y: min(startPt.y, p.y), width: abs(p.x - startPt.x), height: abs(p.y - startPt.y))) }
         needsDisplay = true
     }
@@ -259,10 +259,10 @@ final class AnnotateController: NSObject, NSWindowDelegate {
 
     private func buildToolbar() -> NSView {
         let barH: CGFloat = 46
-        let seg = NSSegmentedControl(images: [UI.symbol("pencil"), UI.symbol("rectangle")].compactMap { $0 },
+        let seg = NSSegmentedControl(images: [UI.symbol("rectangle"), UI.symbol("pencil")].compactMap { $0 },
                                      trackingMode: .selectOne, target: self, action: #selector(toolChanged(_:)))
         seg.selectedSegment = 0
-        seg.setToolTip("画笔", forSegment: 0); seg.setToolTip("矩形", forSegment: 1)
+        seg.setToolTip("矩形（默认）", forSegment: 0); seg.setToolTip("画笔（手动画线）", forSegment: 1)
         seg.setWidth(44, forSegment: 0); seg.setWidth(44, forSegment: 1)
         seg.controlSize = .large
         if #available(macOS 26, *) { seg.borderShape = .capsule }
