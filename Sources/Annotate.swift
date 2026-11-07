@@ -199,6 +199,7 @@ final class AnnotateController: NSObject, NSWindowDelegate {
     private var clefAsked = false
     private var clefScheduled = false
     private var dirToken: UUID?
+    private var escMonitor: Any?
 
     /// 窗口出现和按比例定大小所在的屏幕（整屏截图时是鼠标所在的那块）；nil 用主屏
     let targetScreen: NSScreen?
@@ -226,6 +227,22 @@ final class AnnotateController: NSObject, NSWindowDelegate {
         window.makeFirstResponder(note)
         NSApp.activate(ignoringOtherApps: true)
         Perf.mark("window-shown")
+        installEscToClose()
+    }
+
+    /// Esc 直接关掉批注窗口（不发送、不保存）。例外：
+    ///   · 正在用输入法打字（有未确认的拼音）：Esc 是取消这段输入，交还给输入框
+    ///   · ⌘K 选择器开着：它是另一个窗口，Esc 先由它处理（清搜索 / 关选择器）
+    ///   · 带着 ⌘ ⌃ ⌥ 的 Esc 不算
+    private func installEscToClose() {
+        guard escMonitor == nil else { return }
+        escMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
+            guard let self, e.keyCode == 53, e.window === self.window,
+                  e.modifierFlags.intersection([.command, .control, .option]).isEmpty,
+                  !self.note.hasMarkedText() else { return e }
+            self.window.performClose(nil)
+            return nil
+        }
     }
 
     // MARK: 布局
@@ -392,6 +409,7 @@ final class AnnotateController: NSObject, NSWindowDelegate {
     func windowWillClose(_ n: Notification) {
         picker?.close()
         if let t = dirToken { Directory.shared.unobserve(t); dirToken = nil }
+        if let m = escMonitor { NSEvent.removeMonitor(m); escMonitor = nil }
         onClose?()
     }
 

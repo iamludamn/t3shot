@@ -89,6 +89,18 @@ final class Agent: NSObject, NSApplicationDelegate {
                 NSApp.terminate(nil)
             }
         }
+        // 自检钩子：T3SHOT_ESC_TEST=1：合成一个 Esc 按键送进事件循环，窗口应当关闭（打印 ESC_CLOSED=true），否则 2 秒后打印 false 并退出码 1
+        if env["T3SHOT_ESC_TEST"] != nil {
+            c.onClose = { print("ESC_CLOSED=true"); fflush(stdout); NSApp.terminate(nil) }
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(2))
+                if let ev = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                             windowNumber: c.window.windowNumber, context: nil, characters: "\u{1b}", charactersIgnoringModifiers: "\u{1b}",
+                                             isARepeat: false, keyCode: 53) { NSApp.sendEvent(ev) }
+                try? await Task.sleep(for: .seconds(2))
+                print("ESC_CLOSED=false"); fflush(stdout); exit(1)
+            }
+        }
         // 自检钩子：按常驻模式的方式自动发送一次（窗口立刻收起、结果走提示），用于脚本验证
         if let key = ProcessInfo.processInfo.environment["T3SHOT_AUTOSEND_KEY"] {
             c.dismissOnSend = true

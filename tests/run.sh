@@ -57,6 +57,13 @@ if [ "$GUI" = 1 ]; then
 fi
 
 if [ "$GUI" = 1 ] && [ "$(launchctl managername 2>/dev/null)" = "Aqua" ]; then
+  echo "== 4b Esc 退出批注窗口"
+  T3SHOT_ESC_TEST=1 NO_COLOR=1 "$BIN" --image "$IMG" >"$OUT/esc.log" 2>&1 &
+  PID=$!; for _ in $(seq 1 15); do kill -0 $PID 2>/dev/null || break; sleep 1; done; kill $PID 2>/dev/null
+  grep -q "^ESC_CLOSED=true" "$OUT/esc.log" && ok "合成 Esc 后批注窗口关闭" || { bad "Esc 没有关掉窗口"; tail -5 "$OUT/esc.log" | sed 's/^/  /'; }
+fi
+
+if [ "$GUI" = 1 ] && [ "$(launchctl managername 2>/dev/null)" = "Aqua" ]; then
   echo "== 5 整屏截图（--fullscreen：和左右 Shift 快捷键走同一个截屏函数）"
   SNAP2="$OUT/snap-full"
   T3SHOT_SNAPSHOT="$SNAP2" T3SHOT_SNAPSHOT_DELAY=45 T3SHOT_NOTE="（整屏截图测试）说明一下当前屏幕上的内容" \
