@@ -240,8 +240,16 @@ enum Clef {
         guard !candidates.isEmpty else { throw T3Error("没有候选目标") }
         // 先把线程摘要凑齐（命中缓存很快；没命中的最多等几秒）
         var digests: [String: String] = [:]
+        // 先挑线程再取前 30：candidates 里新线程入口排在前面（最多 40 个），直接 prefix 会把名额全占了，线程一条摘要都拿不到
+        let threads = candidates.filter { !$0.isNew }.prefix(30)
         await withTaskGroup(of: (String, String?).self) { g in
-            for d in candidates.prefix(30) where !d.isNew { g.addTask { (d.key, await (digestProvider?(d) ?? digest(d))) } }
+            for d in threads {
+                g.addTask {
+                    // `??` 的右侧是 autoclosure，不能 await，所以拆开写
+                    if let provider = digestProvider { return (d.key, await provider(d)) }
+                    return (d.key, await digest(d))
+                }
+            }
             for await (k, v) in g { if let v, !v.isEmpty { digests[k] = v } }
         }
         var criteria: [String: Any] = [:]
@@ -256,7 +264,7 @@ enum Clef {
                 desc = "Continue existing thread \"\(d.title)\" in project \"\(d.project)\" (\(d.statusText))."
                 if let s = digests[d.key] { desc += " " + s }
             }
-            criteria[id] = desc
+            criteria[id] = redact(desc)     // 出口统一脱敏：不依赖摘要来源（缓存 / 注入）是否已经处理过
         }
         criteria["none"] = "None of the above fits, or the screenshot does not give enough to tell."
         let body: [String: Any] = [

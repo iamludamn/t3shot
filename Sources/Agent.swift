@@ -30,18 +30,25 @@ final class Agent: NSObject, NSApplicationDelegate {
             guard let img = NSImage(contentsOf: url) else { fputs("无法读取图片\n", stderr); exit(1) }
             let c = open(image: img)
             c.onClose = { NSApp.terminate(nil) }
-            // 自检钩子：T3SHOT_SNAPSHOT=<目录>：等 Clef 判断完（T3SHOT_SNAPSHOT_DELAY 秒，默认 15）后，
+            // 自检钩子：T3SHOT_SNAPSHOT=<目录>：等 Clef 判断完（每 0.5 秒看一次，最长 T3SHOT_SNAPSHOT_DELAY 秒，默认 45）后，
             // 打印胶囊 / 提示行 / 候选数，把批注窗口和 ⌘K 选择器存成 PNG，然后退出。用 cacheDisplay 渲染，不需要屏幕录制权限。
             let env = ProcessInfo.processInfo.environment
             if let dir = env["T3SHOT_SNAPSHOT"] {
                 if let n = env["T3SHOT_NOTE"] { c.note.string = n }
-                let delay = Double(env["T3SHOT_SNAPSHOT_DELAY"] ?? "") ?? 15
+                let maxWait = Double(env["T3SHOT_SNAPSHOT_DELAY"] ?? "") ?? 45
                 Task { @MainActor in
                     try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-                    try? await Task.sleep(for: .seconds(delay))
+                    // 目录刷新 + 线程摘要 + Clef 请求的总时长不固定，固定睡眠会误判；轮询到提示行出现 Clef 的结论（含「不可用」）为止
+                    let t0 = Date()
+                    while Date().timeIntervalSince(t0) < maxWait {
+                        try? await Task.sleep(for: .milliseconds(500))
+                        let s = c.status.stringValue
+                        if s.contains("✨ Clef") && !s.contains("正在看图判断") { break }
+                    }
+                    print(String(format: "CLEF_WAIT=%.1fs", Date().timeIntervalSince(t0)))
                     print("CHIP=\(c.chip.title)\nSTATUS=\(c.status.stringValue)\nSUGGESTIONS=\(c.suggestions.count)")
                     for s in c.suggestions.prefix(5) { print(String(format: "RANK %3.0f%% %@", s.probability * 100, (s.dest.isNew ? "新线程·" : "") + s.dest.title)) }
-                    func save(_ view: NSView?, _ name: String) {
+                    @MainActor func save(_ view: NSView?, _ name: String) {
                         guard let v = view, let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { return }
                         v.cacheDisplay(in: v.bounds, to: rep)
                         try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: dir + "/" + name))

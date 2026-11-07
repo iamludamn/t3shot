@@ -20,7 +20,7 @@ grep -c "warning:" "$OUT/build.log" | xargs -I{} echo "  · 编译警告 {} 条"
 
 echo "== 2 离线自检"
 "$BIN" --selftest 2>&1 | tee "$OUT/selftest.log" | grep -E "^(  ✗|结果|[^ ])" 
-grep -q "^结果：.* 0 失败" "$OUT/selftest.log" && ok "离线自检全部通过" || bad "离线自检有失败（见上）"
+grep -q "^结果：.*，0 失败$" "$OUT/selftest.log" && ok "离线自检全部通过" || bad "离线自检有失败（见上）"
 
 if [ "$LIVE" = 1 ]; then
   echo "== 3 真实环境：--rank"
@@ -44,12 +44,12 @@ if [ "$GUI" = 1 ]; then
     echo "  - 跳过：当前不是 Aqua 图形会话（launchctl managername=$(launchctl managername 2>/dev/null)）"
   else
     SNAP="$OUT/snap"
-    T3SHOT_SNAPSHOT="$SNAP" T3SHOT_SNAPSHOT_DELAY=12 T3SHOT_NOTE="登录按钮在暗色模式下几乎看不清，对比度太低" \
+    T3SHOT_SNAPSHOT="$SNAP" T3SHOT_SNAPSHOT_DELAY=45 T3SHOT_NOTE="登录按钮在暗色模式下几乎看不清，对比度太低" \
       "$BIN" --image "$IMG" >"$OUT/gui.log" 2>&1 &
-    PID=$!; for _ in $(seq 1 60); do kill -0 $PID 2>/dev/null || break; sleep 1; done; kill $PID 2>/dev/null
+    PID=$!; for _ in $(seq 1 90); do kill -0 $PID 2>/dev/null || break; sleep 1; done; kill $PID 2>/dev/null
     grep -E "^(CHIP|STATUS|SUGGESTIONS|RANK|CLEF)" "$OUT/gui.log" | sed 's/^/  /'
     grep -q "^SNAPSHOT_DONE" "$OUT/gui.log" && ok "窗口跑完了快照流程" || { bad "没有跑到快照（窗口没起来？）"; tail -10 "$OUT/gui.log" | sed 's/^/  /'; }
-    grep -q "^CHIP=.*✨[0-9]*%" "$OUT/gui.log" && ok "胶囊上带 ✨ 概率（已预选）" || bad "胶囊上没有 ✨ 概率"
+    grep -q "^CHIP=.*✨[0-9]*%" "$OUT/gui.log" && ok "胶囊上带 ✨ 概率" || bad "胶囊上没有 ✨ 概率"
     S=$(grep -m1 '^SUGGESTIONS=' "$OUT/gui.log" | cut -d= -f2); [ "${S:-0}" -ge 1 ] && ok "选择器有 $S 条 Clef 推荐" || bad "没有 Clef 推荐"
     for f in window picker; do [ -s "$SNAP/$f.png" ] && ok "$f.png 已生成" || bad "$f.png 没生成"; done
     mkdir -p docs/test && cp "$SNAP"/*.png docs/test/ 2>/dev/null && echo "  · 截图已存到 docs/test/"

@@ -221,6 +221,14 @@ enum SelfTest {
         check(Stub.seen.first?.request.url?.absoluteString.hasSuffix("/clef-flash") == true, "T3SHOT_CLEF_MODEL=clef-flash 切换模型")
         setenv("T3SHOT_CLEF_MODEL", "clef", 1)
 
+        // 新线程入口很多（候选里排在线程前面）时，线程的摘要仍然要带上
+        let many = (0..<40).map { project("p\($0)") } + [thread("b", "修登录按钮对比度")]
+        Stub.seen = []
+        _ = try? await Clef.rank(png: png(400, 300), note: "x", candidates: Clef.candidates(from: many))
+        let j3 = (try? JSONSerialization.jsonObject(with: Stub.seen.first?.body ?? Data()) as? [String: Any]) ?? [:]
+        let c3 = ((j3["questions"] as? [String: Any])?["target"] as? [String: Any])?["criteria"] as? [String: String] ?? [:]
+        check(c3.values.contains { $0.contains("Started with") }, "40 个新线程入口时，线程摘要不会被挤掉")
+
         // Workers 绑定风格的响应（没有 result 外壳）
         Stub.handler = { _, _ in
             (200, try! JSONSerialization.data(withJSONObject: ["answers": ["target": ["choice": "new00", "confidence": 1.0, "probabilities": ["new00": 1.0]]]]))

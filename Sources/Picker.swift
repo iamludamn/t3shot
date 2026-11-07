@@ -131,6 +131,8 @@ final class PickerController: NSObject, NSSearchFieldDelegate, NSPopoverDelegate
         search.delegate = self
         search.translatesAutoresizingMaskIntoConstraints = false
         scroll.documentView = doc; scroll.drawsBackground = false; scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true
+        scroll.scrollerStyle = .overlay     // 常驻滚动条会占 17pt，把右侧的概率标签和勾选挤出可见区
+        doc.frame = NSRect(x: 0, y: 0, width: width, height: 0)    // 先定宽：否则首次 rebuild 时行宽被 autoresizing 再撑一倍（840），右侧标签全在可见区外
         scroll.translatesAutoresizingMaskIntoConstraints = false
         footer.font = .systemFont(ofSize: 10.5); footer.textColor = .tertiaryLabelColor
         footer.lineBreakMode = .byTruncatingTail; footer.translatesAutoresizingMaskIntoConstraints = false
@@ -161,6 +163,10 @@ final class PickerController: NSObject, NSSearchFieldDelegate, NSPopoverDelegate
     func show(relativeTo v: NSView) {
         popover.show(relativeTo: v.bounds, of: v, preferredEdge: .maxY)
         vc.view.window?.makeFirstResponder(search)
+        // 构造时还没布局（clip 高度为 0），那次 scrollToVisible 会把列表错误地滚下去，盖住第一组标题：回到顶部再把选中项滚进可见区
+        vc.view.layoutSubtreeIfNeeded()
+        scroll.contentView.scroll(to: .zero); scroll.reflectScrolledClipView(scroll.contentView)
+        if let s = selected, s < views.count { doc.scrollToVisible(views[s].frame.insetBy(dx: 0, dy: -8)) }
     }
     func close() { popover.close() }
     /// 父窗口被提到较高层级时，弹出层跟着提上去
