@@ -20,8 +20,10 @@ private final class RowView: NSView {
     var selected = false { didSet { needsDisplay = true } }
     var onHover: (() -> Void)?
     var onClick: (() -> Void)?
-    init(row: Row, current: Bool, width: CGFloat) {
+    let pct: Double?       // Clef 给这一行的概率
+    init(row: Row, current: Bool, width: CGFloat, pct: Double? = nil) {
         self.row = row
+        self.pct = pct
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: row.height))
         build(current: current)
     }
@@ -69,7 +71,8 @@ private final class RowView: NSView {
                 sub = [env, d.project, rel].filter { !$0.isEmpty }.joined(separator: " · ")
             }
             let title = label(d.title, 13, .medium), subtitle = label(sub, 11, .regular, .secondaryLabelColor)
-            let badgeText = d.needsSetup ? "启用" : d.isNew ? "新建" : (d.isActive ? "\(d.statusText) · 排队跟进" : "空闲")
+            let kindText = d.needsSetup ? "启用" : d.isNew ? "新建" : (d.isActive ? "\(d.statusText) · 排队跟进" : "空闲")
+            let badgeText = pct.map { "✨\(Int(($0 * 100).rounded()))% · \(kindText)" } ?? kindText
             let badge = label(badgeText, 10, .semibold, d.isNew ? .controlAccentColor : (d.isActive ? .systemGreen : .tertiaryLabelColor))
             badge.setContentCompressionResistancePriority(.init(800), for: .horizontal)
             badge.setContentHuggingPriority(.init(800), for: .horizontal)
@@ -116,17 +119,21 @@ final class PickerController: NSObject, NSSearchFieldDelegate, NSPopoverDelegate
     private var expanded: Set<Int> = []
     private let current: Destination?
     private let onPick: (Destination) -> Void
+    private var suggestions: [ClefSuggestion]
+    private var observerToken: UUID?
     private let width: CGFloat = 420
     var isShown: Bool { popover.isShown }
 
-    init(current: Destination?, onPick: @escaping (Destination) -> Void) {
-        self.current = current; self.onPick = onPick
+    init(current: Destination?, suggestions: [ClefSuggestion] = [], onPick: @escaping (Destination) -> Void) {
+        self.current = current; self.onPick = onPick; self.suggestions = suggestions
         super.init()
         let root = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 300))
         search.placeholderString = "搜索项目或线程…"
         search.delegate = self
         search.translatesAutoresizingMaskIntoConstraints = false
         scroll.documentView = doc; scroll.drawsBackground = false; scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true
+        scroll.scrollerStyle = .overlay     // 常驻滚动条会占 17pt，把右侧的概率标签和勾选挤出可见区
+        doc.frame = NSRect(x: 0, y: 0, width: width, height: 0)    // 先定宽：否则首次 rebuild 时行宽被 autoresizing 再撑一倍（840），右侧标签全在可见区外
         scroll.translatesAutoresizingMaskIntoConstraints = false
         footer.font = .systemFont(ofSize: 10.5); footer.textColor = .tertiaryLabelColor
         footer.lineBreakMode = .byTruncatingTail; footer.translatesAutoresizingMaskIntoConstraints = false
@@ -150,17 +157,35 @@ final class PickerController: NSObject, NSSearchFieldDelegate, NSPopoverDelegate
         popover.contentViewController = vc
         popover.behavior = .transient
         popover.delegate = self
-        Directory.shared.onChange.append { [weak self] in self?.rebuild() }
+        observerToken = Directory.shared.observe { [weak self] in self?.rebuild() }
         rebuild()
     }
 
     func show(relativeTo v: NSView) {
         popover.show(relativeTo: v.bounds, of: v, preferredEdge: .maxY)
         vc.view.window?.makeFirstResponder(search)
+        // 构造时还没布局（clip 高度为 0），那次 scrollToVisible 会把列表错误地滚下去，盖住第一组标题：回到顶部再把选中项滚进可见区
+        vc.view.layoutSubtreeIfNeeded()
+        scroll.contentView.scroll(to: .zero); scroll.reflectScrolledClipView(scroll.contentView)
+        if let s = selected, s < views.count { doc.scrollToVisible(views[s].frame.insetBy(dx: 0, dy: -8)) }
     }
-    func close() { popover.close() }
+    func close() { popover.close(); detach() }
+    func popoverDidClose(_ notification: Notification) { detach() }
+    /// 选择器每次打开都会新建一个：关闭时把目录观察者摘掉，别在常驻进程里越攒越多
+    private func detach() { if let t = observerToken { Directory.shared.unobserve(t); observerToken = nil } }
     /// 父窗口被提到较高层级时，弹出层跟着提上去
     func raise() { vc.view.window?.level = .popUpMenu }
+
+    /// 自检：把选择器的内容渲染成 PNG（不需要屏幕录制权限）
+    func snapshotPNG() -> Data? {
+        let v = vc.view
+        guard let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { return nil }
+        v.cacheDisplay(in: v.bounds, to: rep)
+        return rep.representation(using: .png, properties: [:])
+    }
+
+    /// Clef 的结果在选择器打开之后才回来时，原地更新
+    func update(suggestions s: [ClefSuggestion]) { suggestions = s; rebuild() }
 
     @objc private func refresh() { Task { await Directory.shared.refresh() } }
 
@@ -176,6 +201,11 @@ final class PickerController: NSObject, NSSearchFieldDelegate, NSPopoverDelegate
             if a.isActive != b.isActive { return a.isActive }
             return (a.updatedAt ?? .distantPast) > (b.updatedAt ?? .distantPast)
         }
+        // Clef 推荐：概率 ≥ 5% 的前 4 名（再低的只是噪声）；已经在这一组里的不再重复出现在下面的分组
+        let live = Directory.shared.destinations
+        let recommended: [Destination] = q.isEmpty
+            ? suggestions.filter { $0.probability >= Clef.minListedProbability }.prefix(4).compactMap { s in live.first { $0.key == s.dest.key } } : []
+        let recKeys = Set(recommended.map(\.key))
         var out: [Row] = []
         func section(_ i: Int, _ title: String, _ sub: String, _ items: [Destination], limit: Int) {
             guard !items.isEmpty else { return }
@@ -188,9 +218,16 @@ final class PickerController: NSObject, NSSearchFieldDelegate, NSPopoverDelegate
             out += shown.map { .dest($0) }
             if items.count > shown.count { out.append(.more(section: i, hidden: items.count - shown.count)) }
         }
-        section(0, "新线程", "经项目的 scheduler webhook", news, limit: 3)
+        // Clef 按截图内容排出的候选放最上面（搜索时不显示）
+        if q.isEmpty, !suggestions.isEmpty {
+            if !recommended.isEmpty {
+                out.append(.header("Clef 推荐", "按截图内容排序 · 由你确认"))
+                out += recommended.map { .dest($0) }
+            }
+        }
+        section(0, "新线程", "经项目的 scheduler webhook", news.filter { !recKeys.contains($0.key) }, limit: 3)
         let active = threads.filter { $0.isActive }.count
-        section(1, "跟进线程", active > 0 ? "\(active) 个运行中 · 其余空闲" : "未 settle 的空闲线程", threads, limit: 4)
+        section(1, "跟进线程", active > 0 ? "\(active) 个运行中 · 其余空闲" : "未 settle 的空闲线程", threads.filter { !recKeys.contains($0.key) }, limit: 4)
         if out.isEmpty { out.append(.empty(q.isEmpty ? "没有可投递的目标" : "没有匹配「\(q)」的项目或线程")) }
         return out
     }
@@ -204,7 +241,11 @@ final class PickerController: NSObject, NSSearchFieldDelegate, NSPopoverDelegate
         for (i, r) in rows.enumerated() {
             var isCurrent = false
             if case .dest(let d) = r, d.key == current?.key { isCurrent = true }
-            let v = RowView(row: r, current: isCurrent, width: width)
+            var pct: Double?
+            if case .dest(let d) = r, i > 0, i <= 5, case .header(let h, _) = rows[0], h == "Clef 推荐" {
+                pct = suggestions.first { $0.dest.key == d.key }?.probability       // 只标 Clef 推荐区那几行
+            }
+            let v = RowView(row: r, current: isCurrent, width: width, pct: pct)
             v.frame.origin = NSPoint(x: 0, y: y); y += r.height
             v.autoresizingMask = [.width]
             v.onHover = { [weak self] in self?.select(i, scroll: false) }

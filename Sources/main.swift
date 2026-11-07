@@ -1,11 +1,19 @@
 // T3Shot — 原生 macOS 截图批注工具：⌃⇧4 框选 → 批注 → 投递到任意 T3 环境（新线程 / 跟进已有线程）。
 //
 // 用法：
-//   T3Shot                        常驻菜单栏，⌃⇧4 截图
+//   T3Shot                        常驻菜单栏，左右 Shift 同时按 = 截整个屏幕并批注（⌃⇧4 框选区域）
+//   T3Shot --fullscreen           截下鼠标所在的屏幕并打开批注窗口（单次运行，关掉就退出）
 //   T3Shot --image 文件            直接批注一张图（投递后退出）
 //   T3Shot --pair <T3 地址> <配对码>  配对一个 T3 环境（远端用它的 T3 Connect 地址；本机会自动配对）
 //   T3Shot --list                 列出所有环境和投递目标
 //   T3Shot --send <目标> --image 文件 [--note 说明]   无界面投递（<目标> 是 --list 里的 key 或标题片段）
+//   T3Shot --cf-auth <账号 ID>     从标准输入读 Cloudflare API token，存到 ~/.config/t3shot/cloudflare.json（0600），启用 Clef 看图判断目标
+//   T3Shot --cf-wrangler <账号 ID> 用 wrangler 的 OAuth 登录态（自动续期，免建 API token）
+//   T3Shot --bench-capture        三种整屏截图方式的耗时对比（sck / cli-tiff / cli-png）
+//   T3Shot --bench-open [N]       模拟按 N 次快捷键，打印 触发→截屏→窗口创建→窗口显示→首帧 的时间线（不投递）
+//   T3Shot --permissions          只读检查「输入监控」「屏幕录制」权限状态（不弹窗）
+//   T3Shot --selftest             离线自检（桩掉 Cloudflare 和 T3），全部通过退出码 0
+//   T3Shot --rank 图片 [--note 说明]   用 Clef 给图片判断目标，打印候选概率排序（不投递）
 //   T3Shot --install-agent        安装登录启动项（LaunchAgent）
 //   T3Shot --demo                 录屏用的自动演示（见 Demo.swift）
 import AppKit
@@ -60,6 +68,73 @@ if let target = take("--send") {
     }
 }
 
+if has("--bench-capture") {
+    // 三种整屏截图方式的耗时对比：每种 N 次，第 1 次单列（含预热）。不需要窗口，不投递。
+    let n = max(2, Int(take("--runs") ?? "") ?? 6)
+    _ = NSApplication.shared
+    runCLI {
+        guard let screen = NSScreen.main else { throw T3Error("没有屏幕") }
+        print("屏幕 \(Int(screen.frame.width))×\(Int(screen.frame.height)) pt，缩放 \(Int(screen.backingScaleFactor))x")
+        for m in ScreenGrabber.Method.allCases {
+            var times: [Double] = []; var px = ""
+            for _ in 0..<n {
+                let t = Date()
+                guard let img = await ScreenGrabber.grab(screen, method: m) else { print("\(m.rawValue)：失败（权限？）"); break }
+                // 到「能画」为止：把像素真正读一遍，和窗口里首次绘制的代价对齐
+                _ = img.dataProvider?.data
+                times.append(Date().timeIntervalSince(t) * 1000); px = "\(img.width)×\(img.height) px"
+            }
+            guard times.count == n else { continue }
+            let rest = times.dropFirst().sorted()
+            print(String(format: "%-9@ 首次 %5.0f ms · 之后 中位 %5.0f ms  最小 %5.0f  最大 %5.0f · %@", m.rawValue as NSString, times[0], rest[rest.count / 2], rest[0], rest[rest.count - 1], px as NSString))
+        }
+    }
+}
+
+if has("--permissions") {
+    // 只读检查，不会弹授权窗口：左右 Shift 快捷键要「输入监控」，整屏截图要「屏幕录制」
+    print("输入监控（左右 Shift 快捷键）：\(CGPreflightListenEventAccess() ? "已授权" : "未授权")")
+    print("屏幕录制（整屏截图）：\(CGPreflightScreenCaptureAccess() ? "已授权" : "未授权")")
+    exit(0)
+}
+
+if has("--selftest") {
+    Task { exit(await SelfTest.run()) }
+    dispatchMain()
+}
+
+if let account = take("--cf-wrangler") {
+    runCLI {
+        try Clef.saveCreds(accountId: account, token: nil)
+        let t = try await Clef.accessToken(Clef.Creds(accountId: account, token: nil, useWrangler: true))   // 顺便验证登录态可用、必要时续期
+        print("已改用 wrangler 登录态（\(Clef.wranglerConfigPath)），自动续期；当前 token 长度 \(t.count)")
+    }
+}
+
+if let account = take("--cf-auth") {
+    let token = (readLine(strippingNewline: true) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !token.isEmpty else { fputs("用法：echo $CLOUDFLARE_AUTH_TOKEN | T3Shot --cf-auth <账号 ID>\n", stderr); exit(64) }
+    do { try Clef.saveCreds(accountId: account, token: token); print("已保存到 \(Clef.credsPath)（0600）") } catch { fputs("错误：\(error.localizedDescription)\n", stderr); exit(1) }
+    exit(0)
+}
+
+if let image = take("--rank") {
+    let note = take("--note") ?? ""
+    runCLI {
+        guard let png = FileManager.default.contents(atPath: image) else { throw T3Error("读不到图片 \(image)") }
+        guard Clef.isConfigured else { throw T3Error("没有 Cloudflare 凭证：echo $CLOUDFLARE_AUTH_TOKEN | T3Shot --cf-auth <账号 ID>") }
+        await Directory.shared.refresh()
+        let cands = Clef.candidates(from: Directory.shared.destinations)
+        print("候选 \(cands.count) 个")
+        let t0 = Date()
+        let r = try await Clef.rank(png: png, note: note, candidates: cands)
+        print(String(format: "用时 %.1fs · confidence %.2f · 都不合适 %.0f%%", Date().timeIntervalSince(t0), r.confidence, r.noneProbability * 100))
+        for s in r.ranked.prefix(8) {
+            print(String(format: "%3.0f%%  ", s.probability * 100) + (s.dest.isNew ? "新线程 · \(s.dest.title)" : "\(s.dest.statusText) · \(s.dest.title)（\(s.dest.project)）") + "  [\(s.dest.key)]")
+        }
+    }
+}
+
 if has("--install-agent") {
     let exe = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().path
     let plist = NSString(string: "~/Library/LaunchAgents/local.t3shot.plist").expandingTildeInPath
@@ -76,6 +151,8 @@ if has("--install-agent") {
 
 let mode: Agent.Mode
 if has("--demo") { mode = .demo }
+else if has("--fullscreen") { mode = .fullscreen }
+else if let n = take("--bench-open") { mode = .benchOpen(max(1, Int(n) ?? 5)) }
 else if let image = take("--image") { mode = .single(URL(fileURLWithPath: image)) }
 else if args.isEmpty { mode = .resident }
 else { fputs("未知参数 \(args.joined(separator: " "))\n", stderr); exit(64) }

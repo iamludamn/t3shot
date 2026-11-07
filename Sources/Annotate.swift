@@ -55,6 +55,7 @@ final class Canvas: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
+        if Perf.awaitFirstFrame { Perf.awaitFirstFrame = false; Perf.mark("first-frame") }
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         Canvas.backdrop.setFill(); bounds.fill()
         let imgRect = CGRect(x: origin.x, y: origin.y, width: iw * scale, height: ih * scale)
@@ -92,6 +93,22 @@ final class Canvas: NSView {
     func undo() { if !marks.isEmpty { marks.removeLast(); needsDisplay = true } }
     func clear() { marks.removeAll(); needsDisplay = true }
 
+    /// 把图片和批注直接渲染成一张缩小的 CGImage（长边 ≤ maxSide），不经过 PNG 编码。给 Clef 看图用：
+    /// 整屏 Retina 截图原尺寸编码一次 PNG 要几百毫秒，而 Clef 只要 1568 的长边。
+    func renderCGImage(maxSide: Int) -> CGImage? {
+        let s = min(1.0, Double(maxSide) / Double(max(iw, ih)))
+        let w = max(1, Int((Double(iw) * s).rounded())), h = max(1, Int((Double(ih) * s).rounded()))
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.interpolationQuality = .high
+        ctx.scaleBy(x: s, y: s)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
+        drawContent()
+        NSGraphicsContext.restoreGraphicsState()
+        return ctx.makeImage()
+    }
+
     func exportPNG() -> Data? {
         guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(iw), pixelsHigh: Int(ih), bitsPerSample: 8,
                                          samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
@@ -110,7 +127,8 @@ final class PlaceholderTextView: NSTextView {
     private final class PassThroughLabel: NSTextField { override func hitTest(_ p: NSPoint) -> NSView? { nil } }
     private let hint = PassThroughLabel(labelWithString: "写点说明，会作为 prompt 发给 agent…")
     override var string: String { didSet { syncHint() } }
-    override func didChangeText() { super.didChangeText(); syncHint() }
+    var onChange: (() -> Void)?
+    override func didChangeText() { super.didChangeText(); syncHint(); onChange?() }
     override func viewDidMoveToSuperview() {
         super.viewDidMoveToSuperview()
         guard hint.superview == nil else { return }
@@ -172,13 +190,28 @@ final class AnnotateController: NSObject, NSWindowDelegate {
     var isSending = false
     /// 常驻模式：按下发送窗口立刻收起，投递在后台进行，结果用右上角提示显示；失败时把窗口恢复。
     var dismissOnSend = false
+    // Clef：看图给出候选排序。只预选 + 排序，不自动发送
+    private(set) var suggestions: [ClefSuggestion] = []
+    var userPicked = false
+    private var clefLine = ""
+    private var clefTask: Task<Void, Never>?
+    private var clefDebounce: DispatchWorkItem?
+    private var clefAsked = false
+    private var clefScheduled = false
+    private var dirToken: UUID?
+    private var escMonitor: Any?
 
-    init(image: NSImage) {
+    /// 窗口出现和按比例定大小所在的屏幕（整屏截图时是鼠标所在的那块）；nil 用主屏
+    let targetScreen: NSScreen?
+
+    init(image: NSImage, screen: NSScreen? = nil) {
+        targetScreen = screen
         canvas = Canvas(image: image)
         window = NSWindow(contentRect: .zero, styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
         super.init()
         build()
-        Directory.shared.onChange.append { [weak self] in self?.directoryChanged() }
+        note.onChange = { [weak self] in self?.noteChanged() }
+        dirToken = Directory.shared.observe { [weak self] in self?.directoryChanged() }
         directoryChanged()
         if Directory.shared.loadedAt == nil || Date().timeIntervalSince(Directory.shared.loadedAt!) > 20 {
             Task { await Directory.shared.refresh() }
@@ -186,9 +219,30 @@ final class AnnotateController: NSObject, NSWindowDelegate {
     }
 
     func show() {
-        window.center(); window.makeKeyAndOrderFront(nil)
+        window.center()
+        if let vis = targetScreen?.visibleFrame {       // 居中到目标屏幕的可视区
+            window.setFrameOrigin(NSPoint(x: vis.midX - window.frame.width / 2, y: vis.midY - window.frame.height / 2))
+        }
+        window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(note)
         NSApp.activate(ignoringOtherApps: true)
+        Perf.mark("window-shown")
+        installEscToClose()
+    }
+
+    /// Esc 直接关掉批注窗口（不发送、不保存）。例外：
+    ///   · 正在用输入法打字（有未确认的拼音）：Esc 是取消这段输入，交还给输入框
+    ///   · ⌘K 选择器开着：它是另一个窗口，Esc 先由它处理（清搜索 / 关选择器）
+    ///   · 带着 ⌘ ⌃ ⌥ 的 Esc 不算
+    private func installEscToClose() {
+        guard escMonitor == nil else { return }
+        escMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
+            guard let self, e.keyCode == 53, e.window === self.window,
+                  e.modifierFlags.intersection([.command, .control, .option]).isEmpty,
+                  !self.note.hasMarkedText() else { return e }
+            self.window.performClose(nil)
+            return nil
+        }
     }
 
     // MARK: 布局
@@ -331,8 +385,9 @@ final class AnnotateController: NSObject, NSWindowDelegate {
             fillW,
         ])
         // 窗口大小：按截图比例（最多 1.5 倍原尺寸），不小于 900x620，不超过屏幕可视区 90%
-        let vis = NSScreen.main?.visibleFrame.size ?? NSSize(width: 1400, height: 900)
-        let px = NSScreen.main?.backingScaleFactor ?? 2
+        let scr = targetScreen ?? NSScreen.main
+        let vis = scr?.visibleFrame.size ?? NSSize(width: 1400, height: 900)
+        let px = scr?.backingScaleFactor ?? 2
         let w = min(max(canvas.iw * 1.5 / px + 48, 900), vis.width * 0.9)
         let fitH = min((w - 48) * canvas.ih / canvas.iw, canvas.ih * 1.5 / px)
         let h = min(max(fitH + topInset + bottomInset, 620), vis.height * 0.9)
@@ -351,11 +406,17 @@ final class AnnotateController: NSObject, NSWindowDelegate {
         }
     }
 
-    func windowWillClose(_ n: Notification) { picker?.close(); onClose?() }
+    func windowWillClose(_ n: Notification) {
+        picker?.close()
+        if let t = dirToken { Directory.shared.unobserve(t); dirToken = nil }
+        if let m = escMonitor { NSEvent.removeMonitor(m); escMonitor = nil }
+        onClose?()
+    }
 
     // MARK: 目标
 
     private func directoryChanged() {
+        defer { scheduleClef() }
         let all = Directory.shared.destinations
         if let d = destination, let fresh = all.first(where: { $0.key == d.key }) { setDestination(fresh, remember: false); return }
         if destination != nil, Directory.shared.loadedAt != nil, !all.contains(where: { $0.key == destination!.key }) { destination = nil }
@@ -386,24 +447,24 @@ final class AnnotateController: NSObject, NSWindowDelegate {
         let envShort = d.env.label.replacingOccurrences(of: "（本机）", with: "").replacingOccurrences(of: "（经链接）", with: "")
         if d.needsSetup {
             chip.image = UI.symbol("plus.circle.dashed", 13)
-            chip.title = "新线程 · \(d.title)（首次）"
+            chip.title = "新线程 · \(d.title)（首次）" + clefBadge(d)
             sendBtn.title = "启用并新建"
             hint("首次投递：先在 \(envShort) 的「\(d.project)」创建 scheduler webhook 入口，再新建线程")
         } else if d.isNew {
             chip.image = UI.symbol("plus.bubble", 13)
-            chip.title = "新线程 · \(d.title)"
+            chip.title = "新线程 · \(d.title)" + clefBadge(d)
             sendBtn.title = "新建线程"
             hint("经 \(envShort) 的 scheduler webhook 在「\(d.project)」新建线程")
         } else {
             chip.image = UI.symbol("circle.fill", 9, colors: [d.isActive ? .systemGreen : .tertiaryLabelColor])
-            chip.title = "\(d.isActive ? "跟进" : "继续") · \(d.title)"
+            chip.title = "\(d.isActive ? "跟进" : "继续") · \(d.title)" + clefBadge(d)
             sendBtn.title = d.isActive ? "排队跟进" : "发送"
             hint(d.isActive ? "\(d.statusText)：作为下一轮 follow-up 排队，不打断当前任务" : "线程空闲：立即开始新一轮" + (d.env.direct ? "" : "（经链接，仅文字）"))
         }
         chip.toolTip = "\(d.isNew ? "新线程" : d.statusText) · \(d.env.label)\(d.project.isEmpty ? "" : " · \(d.project)")\n选择投递目标  ⌘K"
     }
 
-    private func hint(_ s: String) { if !isSending && lastLink == nil { setStatus(s) } }
+    private func hint(_ s: String) { if !isSending && lastLink == nil { setStatus(clefLine.isEmpty ? s : clefLine + " · " + s) } }
 
     func setStatus(_ s: String, error: Bool = false, ok: Bool = false) {
         status.stringValue = s; status.toolTip = s
@@ -412,7 +473,10 @@ final class AnnotateController: NSObject, NSWindowDelegate {
 
     @objc func openPicker() {
         if let p = picker, p.isShown { p.close(); return }
-        let p = PickerController(current: destination) { [weak self] d in self?.setDestination(d); self?.window.makeFirstResponder(self?.note) }
+        let p = PickerController(current: destination, suggestions: suggestions) { [weak self] d in
+            self?.userPicked = true      // 人选了就不再被 Clef 的结果覆盖
+            self?.setDestination(d); self?.window.makeFirstResponder(self?.note)
+        }
         picker = p
         p.show(relativeTo: chip)
     }
@@ -507,5 +571,77 @@ enum T3Open {
         if let app = ws.urlForApplication(withBundleIdentifier: "com.t3tools.t3code") {
             ws.open([u], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
         } else { ws.open(u) }
+    }
+}
+
+// MARK: - Clef：看图给出候选排序（只预选，不自动发送）
+
+extension AnnotateController {
+    /// 胶囊上的 ✨ 概率标记：这个目标是 Clef 排出来的候选之一
+    func clefBadge(_ d: Destination) -> String {
+        guard let s = suggestions.first(where: { $0.dest.key == d.key }) else { return "" }
+        return "  ✨\(Int((s.probability * 100).rounded()))%"
+    }
+
+    /// 说明改动后 1.5 秒再重新判断一次（说明往往决定了这张图是给哪个线程的）
+    func noteChanged() {
+        guard Clef.isConfigured, clefAsked else { return }
+        clefDebounce?.cancel()
+        let w = DispatchWorkItem { [weak self] in self?.askClef() }
+        clefDebounce = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: w)
+    }
+
+    /// 窗口先出来，再去准备图片和发请求：延后 0.3 秒，不和首帧抢主线程（以前在 init 里同步导出整屏 PNG，窗口要等它）
+    func scheduleClef() {
+        guard Clef.isConfigured, !clefAsked, !clefScheduled, Directory.shared.loadedAt != nil else { return }
+        clefScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self else { return }
+            self.clefScheduled = false
+            if !self.clefAsked { self.askClef() }
+        }
+    }
+
+    func askClef() {
+        guard Clef.isConfigured, !isSending else { return }
+        clefAsked = true
+        let cands = Clef.candidates(from: Directory.shared.destinations)
+        guard !cands.isEmpty, let img = canvas.renderCGImage(maxSide: 1568) else { return }
+        let text = note.string
+        clefTask?.cancel()
+        clefLine = "✨ Clef 正在看图判断…"; renderChip()
+        Perf.mark("clef-asked")
+        clefTask = Task { @MainActor in
+            do {
+                let r = try await Clef.rank(image: img, note: text, candidates: cands)
+                if Task.isCancelled { return }
+                applyClef(r)
+            } catch {
+                if Task.isCancelled { return }
+                print("CLEF ERR: \(error.localizedDescription)")
+                clefLine = "✨ Clef 不可用：\(error.localizedDescription)"; renderChip()
+            }
+        }
+    }
+
+    private func applyClef(_ r: ClefResult) {
+        suggestions = r.ranked
+        pickerController?.update(suggestions: r.ranked)
+        print("CLEF: " + r.ranked.prefix(5).map { "\(Int($0.probability * 100))% \($0.dest.isNew ? "新·" : "")\($0.dest.title)" }.joined(separator: " | ") + " | none \(Int(r.noneProbability * 100))%")
+        guard let top = r.top else { clefLine = "✨ Clef：没有合适的候选"; renderChip(); return }
+        let pct = Int((top.probability * 100).rounded())
+        let name = top.dest.isNew ? "新线程·\(top.dest.title)" : top.dest.title
+        if !Clef.shouldPreselect(r.ranked) {
+            clefLine = "✨ Clef 拿不准（最高 \(pct)%），⌘K 看候选排序"
+            renderChip()
+        } else if userPicked {
+            clefLine = top.dest.key == destination?.key ? "✨ Clef 也推荐这个 \(pct)%" : "✨ Clef 首选「\(name)」\(pct)%"
+            renderChip()
+        } else {
+            clefLine = "✨ Clef 建议 \(pct)%，确认后发送"
+            let fresh = Directory.shared.destinations.first { $0.key == top.dest.key } ?? top.dest
+            setDestination(fresh, remember: false)     // 内部会 renderChip
+        }
     }
 }

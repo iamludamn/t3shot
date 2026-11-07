@@ -1,6 +1,6 @@
 # T3Shot
 
-macOS 原生截图批注工具：**⌃⇧4 框选 → 批注 → 投递到任意一台机器上的 T3**。两种投递方式：
+macOS 原生截图批注工具：**左右 Shift 同时按 → 直接截下整个屏幕 → 用红框圈出要说的内容 → 投递到任意一台机器上的 T3**。两种投递方式：
 
 - **新线程**：走项目 scheduler 的 webhook，在项目里新建线程。
 - **跟进已有线程**：从所有环境里列出未 settle 的线程。运行中的线程用 `queue` 排进下一轮（follow-up，不 steer、不打断）；空闲线程直接开始新一轮。
@@ -8,7 +8,7 @@ macOS 原生截图批注工具：**⌃⇧4 框选 → 批注 → 投递到任意
 界面采用 macOS 26 的 Liquid Glass（`NSGlassEffectView`）。
 
 ```
-⌃⇧4 ─► 系统框选 ─► 批注窗口（画笔/矩形/说明 + 目标胶囊）
+⇧⇧ ─► 截下鼠标所在的整块屏幕 ─► 批注窗口（画笔/矩形/说明 + 目标胶囊）
                          │  ⌘K 选择目标（渐进展开）
                          ▼
           截图作为 T3 原生附件上传到「目标线程所在的机器」
@@ -39,15 +39,53 @@ T3Shot --pair https://prod-xxxx.t3coderelay.com <配对码>
 
 手机不运行 T3，只作为客户端经 T3 Connect 看到同样的线程，所以投递结果会出现在手机上。
 
+## Clef：看图判断投递到哪个线程
+
+接入 Cloudflare Workers AI 的 [Clef](https://developers.cloudflare.com/workers-ai/models/clef/)（System One 决策模型：状态 + 类型化问题 → 每个选项的概率，支持图片）。截图打开后，T3Shot 把**批注后的截图 + 你写的说明**连同所有候选交给 Clef，用一个 Choice 问题让它给每个候选打概率：
+
+- 候选 = 每个项目的「新线程」（带工作目录）+ 未 settle 的已有线程（标题 + 第一条需求 + 最近的用户/助手消息摘录，按线程更新时间缓存，后台预读）+ 「都不合适」。
+- 第一名 ≥ 40% 且领先第二名 ≥ 10 个百分点：胶囊自动预选它，标 `✨87%`，提示行写「Clef 建议 87%，确认后发送」；否则不改当前目标，提示「Clef 拿不准」。
+- ⌘K 选择器最上面多一组「Clef 推荐」（概率 ≥ 5% 的前 4 名，带概率；已在这组里的不再出现在下面的分组），其余照旧。你手动选过之后，Clef 的结果不再覆盖。
+- **始终由人确认**：Clef 只做排序和预选，不会自动发送。说明改动 1.5 秒后重新判断一次。
+
+启用：需要 Cloudflare 账号 ID 和一个有 Workers AI 权限的 API token（dash.cloudflare.com → My Profile → API Tokens）：
+
+```bash
+echo "$CLOUDFLARE_AUTH_TOKEN" | T3Shot --cf-auth <账号 ID>   # 存到 ~/.config/t3shot/cloudflare.json（0600）；也可用环境变量 CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_AUTH_TOKEN
+T3Shot --cf-wrangler <账号 ID>                              # 不建 API token，直接用 wrangler 的 OAuth 登录态（access token 约 1 小时过期，T3Shot 用 refresh token 自动续期并写回 wrangler 配置，和 wrangler 共用同一份）
+T3Shot --rank 截图.png --note "登录页按钮错位"                # 只打印候选概率排序，用来调试，不投递
+```
+
+默认模型 `clef`（27B）；`T3SHOT_CLEF_MODEL=clef-flash` 换成更快的 9B（上下文 24k，候选很多时可能放不下）。没有凭证时整个功能静默关闭。隐私：截图、说明、候选线程标题和几十个字的消息摘录会发到 Cloudflare Workers AI，Clef 为零数据保留。
+
+## 测试
+
+```bash
+tests/run.sh          # 编译 + 离线自检（--selftest）：脱敏、图片预处理、候选筛选、请求体、响应解析与错误、wrangler 续期，全部用桩，不连网
+tests/run.sh --live   # 再用真实 Cloudflare 和真实 T3 线程跑 --rank，断言有候选、有合理的最高概率、耗时 ≤ 20s
+tests/run.sh --gui    # 再起批注窗口：等 Clef 判断完，断言胶囊带 ✨ 概率，把窗口和 ⌘K 选择器存成 docs/test/*.png
+```
+
+界面快照用 `cacheDisplay` 渲染，不需要屏幕录制权限，也不会投递任何东西。需要手动验证的部分：⌘↵ 真正发送、Clef 预选之后手动改选、说明改动后 1.5 秒重新判断。
+
 ## 构建与安装
 
 需要 macOS 26+ 和 Xcode。
 
 ```bash
-./build.sh --install    # 生成 ~/Applications/T3Shot.app，安装登录启动项并启动；⌃⇧4 生效
+./build.sh --install    # 生成 ~/Applications/T3Shot.app，安装登录启动项并启动；左右 Shift 同时按生效
 ```
 
 首次框选时系统会请求「屏幕与系统音频录制」权限。有 Apple Development 证书时 `build.sh` 会用它签名，重新编译后授权不会失效。
+
+## 快捷键：左右 Shift 同时按
+
+按下后**不弹十字线**，直接截下鼠标所在的那块屏幕（多块屏幕也对），批注窗口出现在同一块屏幕上，用红框或画笔圈出要说的内容即可。
+
+- 判定：两个 Shift 先后按下的间隔 ≤ 0.4 秒，且期间没按别的键、没按着 ⌘/⌃/⌥（所以 Shift+字母打大写不会误触发）；触发后 1 秒冷却。
+- **需要「输入监控」权限**：纯修饰键组合没法用系统热键 API 注册，T3Shot 用只读的事件监听实现。首次启动系统会弹一次授权，授权后无需重启（每 5 秒自动重试）。
+- 没授权之前自动用 **⌃⇧4**（框选区域，不需要权限）兜底；菜单栏里两种截图方式也随时可点。
+- `T3Shot --fullscreen`：不走快捷键，直接截屏并打开批注窗口（单次运行，用于脚本和测试）。
 
 ## 交互：渐进式暴露
 
@@ -57,7 +95,7 @@ T3Shot --pair https://prod-xxxx.t3coderelay.com <配对码>
 
 投递语义只在选中目标后才出现：按钮变成「新建线程」「排队跟进」或「发送」，提示行写明会发生什么。
 
-快捷键：⌃⇧4 截图，⌘K 选目标（↑↓ 选择，↩ 确认），⌘↵ 发送，⌘Z 撤销批注。
+快捷键：左右 Shift 同时按 = 截整个屏幕并批注，⌃⇧4 = 框选区域，**Esc 关闭批注窗口（不发送）**，⌘K 选目标（↑↓ 选择，↩ 确认，Esc 先关选择器），⌘↵ 发送，⌘Z 撤销批注。用输入法打字时 Esc 只取消这段输入。
 
 ## 项目的 webhook 入口：自动创建
 
