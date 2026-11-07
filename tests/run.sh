@@ -70,7 +70,8 @@ if [ "$GUI" = 1 ] && [ "$(launchctl managername 2>/dev/null)" = "Aqua" ]; then
     W=$(grep -m1 '^IMAGE=' "$OUT/full.log" | sed -E 's/IMAGE=([0-9]+)x([0-9]+)pt/\1/'); [ "${W:-0}" -ge 800 ] && ok "截下的是整块屏幕（宽 ${W}pt）" || bad "截图宽度只有 ${W:-0}pt，不像整屏"
     grep -q "^CHIP=" "$OUT/full.log" && ok "胶囊有内容" || bad "没有胶囊内容"
     [ -s "$SNAP2/window.png" ] && ok "整屏窗口快照已生成" || bad "整屏窗口快照没生成"
-    mkdir -p docs/test && cp "$SNAP2/window.png" docs/test/window-fullscreen.png 2>/dev/null
+    # 整屏截图含桌面上正在显示的内容：只留在临时目录，不复制进仓库
+    echo "  · 整屏窗口快照：$SNAP2/window.png（含桌面内容，未复制进仓库）"
   fi
 fi
 
