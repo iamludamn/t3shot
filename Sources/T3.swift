@@ -284,6 +284,7 @@ struct Destination {
     let projectId: String
     let updatedAt: Date?
     var byAgent = false        // agent 派生出来的线程（委派、子任务）：默认收起，展开或搜索时才出现
+    var detail = ""            // 项目的工作目录：给 Clef 判断「这张图属于哪个项目」用
 
     static let activeStatuses: Set<String> = ["preparing", "queued", "starting", "running", "waiting"]
     var key: String {
@@ -369,6 +370,7 @@ final class Directory {
             }
             envs = handles; destinations = dests; loadedAt = Date()
             onChange.forEach { $0() }
+            Task.detached { await Clef.prefetch(dests) }      // 后台预读线程摘要，按下快捷键时 Clef 判断更快
         }
         inflight = t
         await t.value
@@ -381,26 +383,31 @@ final class Directory {
         if let l = info["label"] as? String, !h.isLocal { h.label = h.direct ? l : "\(l)（经链接）" }
         let projects = (try await c.call("t3_project_list", ["limit": 100])["projects"] as? [[String: Any]]) ?? []
         var names: [String: String] = [:]
+        var rootMap: [String: String] = [:]
         var models: [String: [String: String]] = [:]
         for p in projects where p["archivedAt"] is NSNull || p["archivedAt"] == nil {
             guard let id = p["id"] as? String else { continue }
             names[id] = p["title"] as? String ?? id
+            rootMap[id] = p["workspaceRoot"] as? String ?? ""
             if let m = p["defaultModelSelection"] as? [String: Any], let model = m["model"] as? String {
                 models[id] = ["model": model, "instanceId": (m["instanceId"] as? String) ?? (m["provider"] as? String) ?? ""]
             }
         }
+        let roots = rootMap   // 冻结成常量，才能被下面的并发任务捕获
         // 每个项目里「每次新建线程」的 webhook 任务 = 新线程入口
         let hooks: [Destination] = await withTaskGroup(of: [Destination].self) { g in
             for (pid, pname) in names {
                 g.addTask {
                     guard let tasks = try? await c.call("list_scheduled_tasks", ["projectId": pid])["tasks"] as? [[String: Any]] else { return [] }
-                    return tasks.compactMap { t in
+                    return tasks.compactMap { t -> Destination? in
                         guard (t["schedule"] as? [String: Any])?["type"] as? String == "webhook", t["enabled"] as? Bool != false,
                               t["boundThreadId"] is NSNull || t["boundThreadId"] == nil,
                               (t["webhookSignature"] as? String ?? "none") == "none",
                               let url = t["webhookUrl"] as? String else { return nil }
-                        return Destination(env: h, kind: .newThread(webhook: url, taskTitle: t["title"] as? String ?? "webhook"),
-                                           title: pname, project: pname, projectId: pid, updatedAt: nil)
+                        var d = Destination(env: h, kind: .newThread(webhook: url, taskTitle: t["title"] as? String ?? "webhook"),
+                                            title: pname, project: pname, projectId: pid, updatedAt: nil)
+                        d.detail = roots[pid] ?? ""
+                        return d
                     }
                 }
             }
@@ -411,7 +418,9 @@ final class Directory {
         // 还没有入口的项目：收在第 2 层，选中后自动创建 webhook 任务
         let hooked = Set(hooks.map(\.projectId))
         let setups: [Destination] = names.filter { !hooked.contains($0.key) }.sorted { $0.value < $1.value }.map { pid, pname in
-            Destination(env: h, kind: .setupProject(projectModel: models[pid]), title: pname, project: pname, projectId: pid, updatedAt: nil)
+            var d = Destination(env: h, kind: .setupProject(projectModel: models[pid]), title: pname, project: pname, projectId: pid, updatedAt: nil)
+            d.detail = roots[pid] ?? ""
+            return d
         }
         // 线程：优先用 shell 快照（和 T3 侧边栏同一份数据），拿不到再用 MCP 列表
         let fromShell = await Directory.sidebarThreads(h)
@@ -424,6 +433,7 @@ final class Directory {
             let pid = t["projectId"] as? String ?? ""
             var d = Destination(env: h, kind: .thread(id: id, status: t["status"] as? String ?? "idle"), title: t["title"] as? String ?? id,
                                 project: names[pid] ?? "", projectId: pid, updatedAt: parseISO(t["updatedAt"]))
+            d.detail = roots[pid] ?? ""
             d.byAgent = (t["createdBy"] as? String) == "agent"
             return d
         }

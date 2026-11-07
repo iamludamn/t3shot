@@ -39,6 +39,24 @@ T3Shot --pair https://prod-xxxx.t3coderelay.com <配对码>
 
 手机不运行 T3，只作为客户端经 T3 Connect 看到同样的线程，所以投递结果会出现在手机上。
 
+## Clef：看图判断投递到哪个线程
+
+接入 Cloudflare Workers AI 的 [Clef](https://developers.cloudflare.com/workers-ai/models/clef/)（System One 决策模型：状态 + 类型化问题 → 每个选项的概率，支持图片）。截图打开后，T3Shot 把**批注后的截图 + 你写的说明**连同所有候选交给 Clef，用一个 Choice 问题让它给每个候选打概率：
+
+- 候选 = 每个项目的「新线程」（带工作目录）+ 未 settle 的已有线程（标题 + 第一条需求 + 最近的用户/助手消息摘录，按线程更新时间缓存，后台预读）+ 「都不合适」。
+- 最高概率 ≥ 50%：胶囊自动预选它，标 `✨87%`，提示行写「Clef 建议 87%，确认后发送」；低于 50%：不改当前目标，提示「Clef 拿不准」。
+- ⌘K 选择器最上面多一组「Clef 推荐」（前 4 名带概率），其余照旧。你手动选过之后，Clef 的结果不再覆盖。
+- **始终由人确认**：Clef 只做排序和预选，不会自动发送。说明改动 1.5 秒后重新判断一次。
+
+启用：需要 Cloudflare 账号 ID 和一个有 Workers AI 权限的 API token（dash.cloudflare.com → My Profile → API Tokens）：
+
+```bash
+echo "$CLOUDFLARE_AUTH_TOKEN" | T3Shot --cf-auth <账号 ID>   # 存到 ~/.config/t3shot/cloudflare.json（0600）；也可用环境变量 CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_AUTH_TOKEN
+T3Shot --rank 截图.png --note "登录页按钮错位"                # 只打印候选概率排序，用来调试，不投递
+```
+
+默认模型 `clef`（27B）；`T3SHOT_CLEF_MODEL=clef-flash` 换成更快的 9B（上下文 24k，候选很多时可能放不下）。没有凭证时整个功能静默关闭。隐私：截图、说明、候选线程标题和几十个字的消息摘录会发到 Cloudflare Workers AI，Clef 为零数据保留。
+
 ## 构建与安装
 
 需要 macOS 26+ 和 Xcode。

@@ -20,8 +20,10 @@ private final class RowView: NSView {
     var selected = false { didSet { needsDisplay = true } }
     var onHover: (() -> Void)?
     var onClick: (() -> Void)?
-    init(row: Row, current: Bool, width: CGFloat) {
+    let pct: Double?       // Clef 给这一行的概率
+    init(row: Row, current: Bool, width: CGFloat, pct: Double? = nil) {
         self.row = row
+        self.pct = pct
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: row.height))
         build(current: current)
     }
@@ -69,7 +71,8 @@ private final class RowView: NSView {
                 sub = [env, d.project, rel].filter { !$0.isEmpty }.joined(separator: " · ")
             }
             let title = label(d.title, 13, .medium), subtitle = label(sub, 11, .regular, .secondaryLabelColor)
-            let badgeText = d.needsSetup ? "启用" : d.isNew ? "新建" : (d.isActive ? "\(d.statusText) · 排队跟进" : "空闲")
+            let kindText = d.needsSetup ? "启用" : d.isNew ? "新建" : (d.isActive ? "\(d.statusText) · 排队跟进" : "空闲")
+            let badgeText = pct.map { "✨\(Int(($0 * 100).rounded()))% · \(kindText)" } ?? kindText
             let badge = label(badgeText, 10, .semibold, d.isNew ? .controlAccentColor : (d.isActive ? .systemGreen : .tertiaryLabelColor))
             badge.setContentCompressionResistancePriority(.init(800), for: .horizontal)
             badge.setContentHuggingPriority(.init(800), for: .horizontal)
@@ -116,11 +119,12 @@ final class PickerController: NSObject, NSSearchFieldDelegate, NSPopoverDelegate
     private var expanded: Set<Int> = []
     private let current: Destination?
     private let onPick: (Destination) -> Void
+    private var suggestions: [ClefSuggestion]
     private let width: CGFloat = 420
     var isShown: Bool { popover.isShown }
 
-    init(current: Destination?, onPick: @escaping (Destination) -> Void) {
-        self.current = current; self.onPick = onPick
+    init(current: Destination?, suggestions: [ClefSuggestion] = [], onPick: @escaping (Destination) -> Void) {
+        self.current = current; self.onPick = onPick; self.suggestions = suggestions
         super.init()
         let root = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 300))
         search.placeholderString = "搜索项目或线程…"
@@ -162,6 +166,9 @@ final class PickerController: NSObject, NSSearchFieldDelegate, NSPopoverDelegate
     /// 父窗口被提到较高层级时，弹出层跟着提上去
     func raise() { vc.view.window?.level = .popUpMenu }
 
+    /// Clef 的结果在选择器打开之后才回来时，原地更新
+    func update(suggestions s: [ClefSuggestion]) { suggestions = s; rebuild() }
+
     @objc private func refresh() { Task { await Directory.shared.refresh() } }
 
     // MARK: 模型
@@ -188,6 +195,15 @@ final class PickerController: NSObject, NSSearchFieldDelegate, NSPopoverDelegate
             out += shown.map { .dest($0) }
             if items.count > shown.count { out.append(.more(section: i, hidden: items.count - shown.count)) }
         }
+        // Clef 按截图内容排出的候选放最上面（搜索时不显示）
+        if q.isEmpty, !suggestions.isEmpty {
+            let live = Directory.shared.destinations
+            let top = suggestions.prefix(4).compactMap { s in live.first { $0.key == s.dest.key } }
+            if !top.isEmpty {
+                out.append(.header("Clef 推荐", "按截图内容排序 · 由你确认"))
+                out += top.map { .dest($0) }
+            }
+        }
         section(0, "新线程", "经项目的 scheduler webhook", news, limit: 3)
         let active = threads.filter { $0.isActive }.count
         section(1, "跟进线程", active > 0 ? "\(active) 个运行中 · 其余空闲" : "未 settle 的空闲线程", threads, limit: 4)
@@ -204,7 +220,11 @@ final class PickerController: NSObject, NSSearchFieldDelegate, NSPopoverDelegate
         for (i, r) in rows.enumerated() {
             var isCurrent = false
             if case .dest(let d) = r, d.key == current?.key { isCurrent = true }
-            let v = RowView(row: r, current: isCurrent, width: width)
+            var pct: Double?
+            if case .dest(let d) = r, i > 0, i <= 5, case .header(let h, _) = rows[0], h == "Clef 推荐" {
+                pct = suggestions.first { $0.dest.key == d.key }?.probability       // 只标 Clef 推荐区那几行
+            }
+            let v = RowView(row: r, current: isCurrent, width: width, pct: pct)
             v.frame.origin = NSPoint(x: 0, y: y); y += r.height
             v.autoresizingMask = [.width]
             v.onHover = { [weak self] in self?.select(i, scroll: false) }

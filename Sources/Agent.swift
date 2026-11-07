@@ -37,6 +37,7 @@ final class Agent: NSObject, NSApplicationDelegate {
                 Task { @MainActor in
                     await Directory.shared.refresh()
                     guard let d = Directory.shared.destinations.first(where: { $0.key == key }) else { fputs("找不到目标 \(key)\n", stderr); exit(3) }
+                    c.userPicked = true
                     c.setDestination(d, remember: false)
                     c.note.string = ProcessInfo.processInfo.environment["T3SHOT_NOTE"] ?? "T3Shot 自检"
                     try? await Task.sleep(for: .seconds(1))

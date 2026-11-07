@@ -6,6 +6,8 @@
 //   T3Shot --pair <T3 地址> <配对码>  配对一个 T3 环境（远端用它的 T3 Connect 地址；本机会自动配对）
 //   T3Shot --list                 列出所有环境和投递目标
 //   T3Shot --send <目标> --image 文件 [--note 说明]   无界面投递（<目标> 是 --list 里的 key 或标题片段）
+//   T3Shot --cf-auth <账号 ID>     从标准输入读 Cloudflare API token，存到 ~/.config/t3shot/cloudflare.json（0600），启用 Clef 看图判断目标
+//   T3Shot --rank 图片 [--note 说明]   用 Clef 给图片判断目标，打印候选概率排序（不投递）
 //   T3Shot --install-agent        安装登录启动项（LaunchAgent）
 //   T3Shot --demo                 录屏用的自动演示（见 Demo.swift）
 import AppKit
@@ -57,6 +59,30 @@ if let target = take("--send") {
         print("→ \(d.isNew ? "新线程" : d.statusText) · \(d.env.label) · \(d.title)")
         let r = try await Delivery.deliver(d, note: note, png: png, fileName: (image as NSString).lastPathComponent)
         print("OK: \(r.message)"); if let l = r.link { print("LINK: \(l.absoluteString)") }
+    }
+}
+
+if let account = take("--cf-auth") {
+    let token = (readLine(strippingNewline: true) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !token.isEmpty else { fputs("用法：echo $CLOUDFLARE_AUTH_TOKEN | T3Shot --cf-auth <账号 ID>\n", stderr); exit(64) }
+    do { try Clef.saveCreds(accountId: account, token: token); print("已保存到 \(Clef.credsPath)（0600）") } catch { fputs("错误：\(error.localizedDescription)\n", stderr); exit(1) }
+    exit(0)
+}
+
+if let image = take("--rank") {
+    let note = take("--note") ?? ""
+    runCLI {
+        guard let png = FileManager.default.contents(atPath: image) else { throw T3Error("读不到图片 \(image)") }
+        guard Clef.isConfigured else { throw T3Error("没有 Cloudflare 凭证：echo $CLOUDFLARE_AUTH_TOKEN | T3Shot --cf-auth <账号 ID>") }
+        await Directory.shared.refresh()
+        let cands = Clef.candidates(from: Directory.shared.destinations)
+        print("候选 \(cands.count) 个")
+        let t0 = Date()
+        let r = try await Clef.rank(png: png, note: note, candidates: cands)
+        print(String(format: "用时 %.1fs · confidence %.2f · 都不合适 %.0f%%", Date().timeIntervalSince(t0), r.confidence, r.noneProbability * 100))
+        for s in r.ranked.prefix(8) {
+            print(String(format: "%3.0f%%  ", s.probability * 100) + (s.dest.isNew ? "新线程 · \(s.dest.title)" : "\(s.dest.statusText) · \(s.dest.title)（\(s.dest.project)）") + "  [\(s.dest.key)]")
+        }
     }
 }
 

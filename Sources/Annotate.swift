@@ -110,7 +110,8 @@ final class PlaceholderTextView: NSTextView {
     private final class PassThroughLabel: NSTextField { override func hitTest(_ p: NSPoint) -> NSView? { nil } }
     private let hint = PassThroughLabel(labelWithString: "写点说明，会作为 prompt 发给 agent…")
     override var string: String { didSet { syncHint() } }
-    override func didChangeText() { super.didChangeText(); syncHint() }
+    var onChange: (() -> Void)?
+    override func didChangeText() { super.didChangeText(); syncHint(); onChange?() }
     override func viewDidMoveToSuperview() {
         super.viewDidMoveToSuperview()
         guard hint.superview == nil else { return }
@@ -172,12 +173,20 @@ final class AnnotateController: NSObject, NSWindowDelegate {
     var isSending = false
     /// 常驻模式：按下发送窗口立刻收起，投递在后台进行，结果用右上角提示显示；失败时把窗口恢复。
     var dismissOnSend = false
+    // Clef：看图给出候选排序。只预选 + 排序，不自动发送
+    private(set) var suggestions: [ClefSuggestion] = []
+    var userPicked = false
+    private var clefLine = ""
+    private var clefTask: Task<Void, Never>?
+    private var clefDebounce: DispatchWorkItem?
+    private var clefAsked = false
 
     init(image: NSImage) {
         canvas = Canvas(image: image)
         window = NSWindow(contentRect: .zero, styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
         super.init()
         build()
+        note.onChange = { [weak self] in self?.noteChanged() }
         Directory.shared.onChange.append { [weak self] in self?.directoryChanged() }
         directoryChanged()
         if Directory.shared.loadedAt == nil || Date().timeIntervalSince(Directory.shared.loadedAt!) > 20 {
@@ -356,6 +365,7 @@ final class AnnotateController: NSObject, NSWindowDelegate {
     // MARK: 目标
 
     private func directoryChanged() {
+        defer { if !clefAsked, Directory.shared.loadedAt != nil { askClef() } }
         let all = Directory.shared.destinations
         if let d = destination, let fresh = all.first(where: { $0.key == d.key }) { setDestination(fresh, remember: false); return }
         if destination != nil, Directory.shared.loadedAt != nil, !all.contains(where: { $0.key == destination!.key }) { destination = nil }
@@ -386,24 +396,24 @@ final class AnnotateController: NSObject, NSWindowDelegate {
         let envShort = d.env.label.replacingOccurrences(of: "（本机）", with: "").replacingOccurrences(of: "（经链接）", with: "")
         if d.needsSetup {
             chip.image = UI.symbol("plus.circle.dashed", 13)
-            chip.title = "新线程 · \(d.title)（首次）"
+            chip.title = "新线程 · \(d.title)（首次）" + clefBadge(d)
             sendBtn.title = "启用并新建"
             hint("首次投递：先在 \(envShort) 的「\(d.project)」创建 scheduler webhook 入口，再新建线程")
         } else if d.isNew {
             chip.image = UI.symbol("plus.bubble", 13)
-            chip.title = "新线程 · \(d.title)"
+            chip.title = "新线程 · \(d.title)" + clefBadge(d)
             sendBtn.title = "新建线程"
             hint("经 \(envShort) 的 scheduler webhook 在「\(d.project)」新建线程")
         } else {
             chip.image = UI.symbol("circle.fill", 9, colors: [d.isActive ? .systemGreen : .tertiaryLabelColor])
-            chip.title = "\(d.isActive ? "跟进" : "继续") · \(d.title)"
+            chip.title = "\(d.isActive ? "跟进" : "继续") · \(d.title)" + clefBadge(d)
             sendBtn.title = d.isActive ? "排队跟进" : "发送"
             hint(d.isActive ? "\(d.statusText)：作为下一轮 follow-up 排队，不打断当前任务" : "线程空闲：立即开始新一轮" + (d.env.direct ? "" : "（经链接，仅文字）"))
         }
         chip.toolTip = "\(d.isNew ? "新线程" : d.statusText) · \(d.env.label)\(d.project.isEmpty ? "" : " · \(d.project)")\n选择投递目标  ⌘K"
     }
 
-    private func hint(_ s: String) { if !isSending && lastLink == nil { setStatus(s) } }
+    private func hint(_ s: String) { if !isSending && lastLink == nil { setStatus(clefLine.isEmpty ? s : clefLine + " · " + s) } }
 
     func setStatus(_ s: String, error: Bool = false, ok: Bool = false) {
         status.stringValue = s; status.toolTip = s
@@ -412,7 +422,10 @@ final class AnnotateController: NSObject, NSWindowDelegate {
 
     @objc func openPicker() {
         if let p = picker, p.isShown { p.close(); return }
-        let p = PickerController(current: destination) { [weak self] d in self?.setDestination(d); self?.window.makeFirstResponder(self?.note) }
+        let p = PickerController(current: destination, suggestions: suggestions) { [weak self] d in
+            self?.userPicked = true      // 人选了就不再被 Clef 的结果覆盖
+            self?.setDestination(d); self?.window.makeFirstResponder(self?.note)
+        }
         picker = p
         p.show(relativeTo: chip)
     }
@@ -507,5 +520,65 @@ enum T3Open {
         if let app = ws.urlForApplication(withBundleIdentifier: "com.t3tools.t3code") {
             ws.open([u], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
         } else { ws.open(u) }
+    }
+}
+
+// MARK: - Clef：看图给出候选排序（只预选，不自动发送）
+
+extension AnnotateController {
+    /// 胶囊上的 ✨ 概率标记：这个目标是 Clef 排出来的候选之一
+    func clefBadge(_ d: Destination) -> String {
+        guard let s = suggestions.first(where: { $0.dest.key == d.key }) else { return "" }
+        return "  ✨\(Int((s.probability * 100).rounded()))%"
+    }
+
+    /// 说明改动后 1.5 秒再重新判断一次（说明往往决定了这张图是给哪个线程的）
+    func noteChanged() {
+        guard Clef.isConfigured, clefAsked else { return }
+        clefDebounce?.cancel()
+        let w = DispatchWorkItem { [weak self] in self?.askClef() }
+        clefDebounce = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: w)
+    }
+
+    func askClef() {
+        guard Clef.isConfigured, !isSending else { return }
+        clefAsked = true
+        let cands = Clef.candidates(from: Directory.shared.destinations)
+        guard !cands.isEmpty, let png = canvas.exportPNG() else { return }
+        let text = note.string
+        clefTask?.cancel()
+        clefLine = "✨ Clef 正在看图判断…"; renderChip()
+        clefTask = Task { @MainActor in
+            do {
+                let r = try await Clef.rank(png: png, note: text, candidates: cands)
+                if Task.isCancelled { return }
+                applyClef(r)
+            } catch {
+                if Task.isCancelled { return }
+                print("CLEF ERR: \(error.localizedDescription)")
+                clefLine = "✨ Clef 不可用：\(error.localizedDescription)"; renderChip()
+            }
+        }
+    }
+
+    private func applyClef(_ r: ClefResult) {
+        suggestions = r.ranked
+        pickerController?.update(suggestions: r.ranked)
+        print("CLEF: " + r.ranked.prefix(5).map { "\(Int($0.probability * 100))% \($0.dest.isNew ? "新·" : "")\($0.dest.title)" }.joined(separator: " | ") + " | none \(Int(r.noneProbability * 100))%")
+        guard let top = r.top else { clefLine = "✨ Clef：没有合适的候选"; renderChip(); return }
+        let pct = Int((top.probability * 100).rounded())
+        let name = top.dest.isNew ? "新线程·\(top.dest.title)" : top.dest.title
+        if top.probability < Clef.preselectThreshold {
+            clefLine = "✨ Clef 拿不准（最高 \(pct)%），⌘K 看候选排序"
+            renderChip()
+        } else if userPicked {
+            clefLine = top.dest.key == destination?.key ? "✨ Clef 也推荐这个 \(pct)%" : "✨ Clef 首选「\(name)」\(pct)%"
+            renderChip()
+        } else {
+            clefLine = "✨ Clef 建议 \(pct)%，确认后发送"
+            let fresh = Directory.shared.destinations.first { $0.key == top.dest.key } ?? top.dest
+            setDestination(fresh, remember: false)     // 内部会 renderChip
+        }
     }
 }
