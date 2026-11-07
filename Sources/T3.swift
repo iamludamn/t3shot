@@ -4,7 +4,7 @@
 //   · 本机环境（MacBook）：server-runtime.json 里的 origin，T3Shot 用本机 t3 CLI 自动签发配对码完成配对。
 //   · 远端环境（omarchy 24/7）：它自己的 T3 Connect 地址（https://prod-…t3coderelay.com），用一次性配对码配对，
 //     和手机配对是同一套机制。配对后图片能作为原生附件上传到线程所在的机器。
-//   · 已链接但未配对的环境：经本机 T3 的 environment link 隧道转发（工具参数带 environmentId），只能发文字。
+//   · 已链接但未配对的环境：经本机 T3 的 environment link 隧道转发（工具参数带 environmentId），不能传图，投递会被拒绝，需要先配对。
 //   · 新线程：走该项目 scheduler 的 webhook（relay.t3.codes），目标机器离线时 relay 会暂存请求。
 import Foundation
 
@@ -100,6 +100,18 @@ actor MCPClient {
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
         guard (200..<300).contains(code) else { throw T3Error("图片上传返回 HTTP \(code)") }
         return id
+    }
+
+    /// 上传带重试：网络抖动、T3 Connect 临时 5xx 都再试；凭证失效（401）重试没用，直接抛出。
+    func uploadImageWithRetry(_ png: Data, name: String, attempts: Int = 3) async throws -> String {
+        var last: Error = T3Error("上传失败")
+        for i in 0..<attempts {
+            do { return try await uploadImage(png, name: name) }
+            catch let e as T3Error where e.message.contains("401") { throw T3Error("图片没传上去，已取消发送：\(e.message)") }
+            catch { last = error }
+            if i < attempts - 1 { try? await Task.sleep(for: .seconds(Double(i + 1))) }
+        }
+        throw T3Error("图片上传失败（重试 \(attempts) 次），已取消发送：\(last.localizedDescription)")
     }
 }
 
@@ -253,7 +265,7 @@ func sha256URLSafe(_ s: String) -> String {
 
 // MARK: - 投递目标目录
 
-/// 一个能投递的 T3 环境。direct：T3Shot 自己持有这台机器的凭证（可传图）；否则经本机 link 转发（仅文字）。
+/// 一个能投递的 T3 环境。direct：T3Shot 自己持有这台机器的凭证（可传图）；否则不能投递（图片传不过去）。
 final class EnvHandle: @unchecked Sendable {
     let id: String
     var label: String
@@ -476,11 +488,11 @@ extension Directory {
 
 enum ProjectSetup {
     static let taskTitle = "T3Shot 截图批注"
-    /// 只给截图位置和用户批注，不再注入流程指令（读 AGENTS.md、开分支等交给项目和用户自己的约定）。
+    /// 只告诉 agent 有一张截图、在哪、批注是什么。图片一定已经送达（投递前校验），所以不需要任何"没送达"的分支。
     static let prompt = """
+    用户上传了一张截图，路径：{{body.image_remote_path}}
+    截图批注如下：
     {{body.note}}
-
-    截图（红色笔迹和红框是批注；为空表示图片没有送达）：{{body.image_remote_path}}
     """
 
     struct Model { let selection: [String: String]; let source: String }
@@ -578,20 +590,20 @@ enum Delivery {
         }
         let host = Host.current().localizedName ?? "Mac"
         let started = Date()
-        var attachmentId: String?
-        var uploadError: String?
-        if d.env.direct {
-            do { attachmentId = try await d.env.client.uploadImage(png, name: fileName) } catch { uploadError = error.localizedDescription }
-        } else { uploadError = "该环境未与 T3Shot 配对，只能经链接发文字" }
-        let remotePath = attachmentId.map { "~/.t3/userdata/attachments/\($0).png" }
+        // 截图必须送达，否则整次投递失败：宁可让用户重试，也不发一条没有图的批注。
+        guard d.env.direct else {
+            throw T3Error("「\(d.env.label)」还没有与 T3Shot 配对，图片传不过去，已取消发送。请先配对该环境（T3Shot --pair）。")
+        }
+        let attachmentId = try await d.env.client.uploadImageWithRetry(png, name: fileName)
+        let remotePath = "~/.t3/userdata/attachments/\(attachmentId).png"
 
         switch d.kind {
         case .newThread(let webhook, _):
             let payload: [String: Any] = [
                 "source": "t3shot", "note": note, "host": host,
                 "created_at": ISO8601DateFormatter().string(from: started),
-                "image_delivered": remotePath != nil, "image_remote_path": remotePath ?? "",
-                "image_attachment_id": attachmentId ?? "", "image_path": fileName, "environment": d.env.label,
+                "image_delivered": true, "image_remote_path": remotePath,
+                "image_attachment_id": attachmentId, "image_path": fileName, "environment": d.env.label,
             ]
             var req = URLRequest(url: URL(string: webhook)!, timeoutInterval: 20)
             req.httpMethod = "POST"; req.httpBody = try JSONSerialization.data(withJSONObject: payload)
@@ -600,7 +612,7 @@ enum Delivery {
             let (data, resp) = try await URLSession.shared.data(for: req)
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             guard (200..<300).contains(code) else { throw T3Error("webhook 返回 \(code)：\(String(data: data.prefix(120), encoding: .utf8) ?? "")") }
-            let img = remotePath != nil ? "截图已作为附件送到 \(d.env.label)" : "图片未送达（\(uploadError ?? "")）"
+            let img = "截图已作为附件送到 \(d.env.label)"
             if !waitForThread {
                 let dd = d
                 return DeliveryResult(message: "已投递到「\(d.project)」· \(img)", link: nil,
@@ -616,15 +628,13 @@ enum Delivery {
 
         case .thread(let tid, let status):
             let active = Destination.activeStatuses.contains(status)
-            let f = DateFormatter(); f.dateFormat = "HH:mm"
-            var text = "【T3Shot 截图批注 · 来自 \(host) · \(f.string(from: started))】\n\(note.isEmpty ? "（无文字说明）" : note)"
-            if let p = remotePath, active { text += "\n\n截图（红色笔迹和红框是批注）：\(p)" }
-            if remotePath == nil { text += "\n\n（截图未送达：\(uploadError ?? "未知原因")）" }
+            // 空闲线程图片走原生附件；活跃线程排队的 follow-up 带不了附件，给路径
+            let text = "用户上传了一张截图\(active ? "，路径：\(remotePath)" : "")\n截图批注如下：\n\(note.isEmpty ? "（无文字批注）" : note)"
             let link = threadWebLink(env: d.env.id, thread: tid)
-            if !active, let aid = attachmentId {
+            if !active {
                 // 空闲线程：原生附件 + 立即开始新一轮
                 _ = try await d.env.client.call("t3_thread_send_attachments", ["threadId": tid, "message": text,
-                    "attachments": [["type": "image", "id": aid, "name": fileName, "mimeType": "image/png", "sizeBytes": png.count]]])
+                    "attachments": [["type": "image", "id": attachmentId, "name": fileName, "mimeType": "image/png", "sizeBytes": png.count]]])
                 return DeliveryResult(message: "已发送，线程开始新一轮（截图为原生附件）", link: link, threadId: tid)
             }
             // 活跃线程：follow-up 排队，不 steer、不打断

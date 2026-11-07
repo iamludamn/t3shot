@@ -26,7 +26,7 @@ T3Shot 不依赖 Tailscale 或 SSH。每个环境（运行 T3 的机器）都是
 |---|---|---|---|
 | 本机（MacBook） | `~/.t3/userdata/server-runtime.json` 的 origin | 用本机 `t3 auth pairing create` 自动配对 | 读写 + 原生附件 |
 | 远端（omarchy，24/7） | 它的 T3 Connect 地址 `https://prod-…t3coderelay.com` | 一次性配对码，和手机配对同一套机制 | 读写 + 原生附件 |
-| 已链接、未配对 | 经本机 T3 的 environment link 转发（工具参数带 `environmentId`） | 复用本机凭证 | 读写，仅文字 |
+| 已链接、未配对 | 经本机 T3 的 environment link 转发（工具参数带 `environmentId`） | 复用本机凭证 | 读写，但不能投递：图片传不过去，先 `--pair` 配对 |
 
 配对走 T3 的 MCP OAuth（PKCE），用配对码代替浏览器审批，拿到 30 天 full-access 的 MCP 凭证，存在 `~/.config/t3shot/environments.json`（0600）。
 
@@ -109,7 +109,7 @@ T3Shot 把每个项目里**启用的、每次新建线程（不绑定线程）�
    - 环境默认模型（`settings.json` 的 `defaultModelSelection`）。
 
    后两层 MCP 读不到。本机直接读文件；远端退一步用该项目、再到该环境最近线程实际用的模型。找到后用 `t3_project_update` 写回项目记录，项目的实际行为不变。
-2. **建任务**：用 `schedule_task` 建一个名为「T3Shot 截图批注」的 webhook 任务，prompt 模板只有两部分：用户批注和截图路径，不附带处理流程的指令。项目里已有同名任务就复用（prompt 也会更新成最新模板），不重复创建。
+2. **建任务**：用 `schedule_task` 建一个名为「T3Shot 截图批注」的 webhook 任务，prompt 模板只有「用户上传了一张截图，路径：…，截图批注如下：…」，不附带处理流程的指令。截图必须先传到目标机器才会投递：上传失败会重试 3 次，仍失败或环境未配对就整次取消并报错，不会发出一条没有图的批注。项目里已有同名任务就复用（prompt 也会更新成最新模板），不重复创建。
 3. **投递**：照常投递，之后这个项目就是普通的「新线程」目标。
 
 手动建的任务也可以，prompt 里能用这些占位符：

@@ -459,7 +459,7 @@ final class AnnotateController: NSObject, NSWindowDelegate {
             chip.image = UI.symbol("circle.fill", 9, colors: [d.isActive ? .systemGreen : .tertiaryLabelColor])
             chip.title = "\(d.isActive ? "跟进" : "继续") · \(d.title)" + clefBadge(d)
             sendBtn.title = d.isActive ? "排队跟进" : "发送"
-            hint(d.isActive ? "\(d.statusText)：作为下一轮 follow-up 排队，不打断当前任务" : "线程空闲：立即开始新一轮" + (d.env.direct ? "" : "（经链接，仅文字）"))
+            hint(d.isActive ? "\(d.statusText)：作为下一轮 follow-up 排队，不打断当前任务" : "线程空闲：立即开始新一轮" + (d.env.direct ? "" : "（该环境未配对，图片传不过去，无法发送）"))
         }
         chip.toolTip = "\(d.isNew ? "新线程" : d.statusText) · \(d.env.label)\(d.project.isEmpty ? "" : " · \(d.project)")\n选择投递目标  ⌘K"
     }
