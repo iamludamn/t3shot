@@ -44,8 +44,8 @@ T3Shot --pair https://prod-xxxx.t3coderelay.com <配对码>
 接入 Cloudflare Workers AI 的 [Clef](https://developers.cloudflare.com/workers-ai/models/clef/)（System One 决策模型：状态 + 类型化问题 → 每个选项的概率，支持图片）。截图打开后，T3Shot 把**批注后的截图 + 你写的说明**连同所有候选交给 Clef，用一个 Choice 问题让它给每个候选打概率：
 
 - 候选 = 每个项目的「新线程」（带工作目录）+ 未 settle 的已有线程（标题 + 第一条需求 + 最近的用户/助手消息摘录，按线程更新时间缓存，后台预读）+ 「都不合适」。
-- 最高概率 ≥ 50%：胶囊自动预选它，标 `✨87%`，提示行写「Clef 建议 87%，确认后发送」；低于 50%：不改当前目标，提示「Clef 拿不准」。
-- ⌘K 选择器最上面多一组「Clef 推荐」（前 4 名带概率），其余照旧。你手动选过之后，Clef 的结果不再覆盖。
+- 第一名 ≥ 40% 且领先第二名 ≥ 10 个百分点：胶囊自动预选它，标 `✨87%`，提示行写「Clef 建议 87%，确认后发送」；否则不改当前目标，提示「Clef 拿不准」。
+- ⌘K 选择器最上面多一组「Clef 推荐」（概率 ≥ 5% 的前 4 名，带概率；已在这组里的不再出现在下面的分组），其余照旧。你手动选过之后，Clef 的结果不再覆盖。
 - **始终由人确认**：Clef 只做排序和预选，不会自动发送。说明改动 1.5 秒后重新判断一次。
 
 启用：需要 Cloudflare 账号 ID 和一个有 Workers AI 权限的 API token（dash.cloudflare.com → My Profile → API Tokens）：

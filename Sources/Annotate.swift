@@ -569,7 +569,7 @@ extension AnnotateController {
         guard let top = r.top else { clefLine = "✨ Clef：没有合适的候选"; renderChip(); return }
         let pct = Int((top.probability * 100).rounded())
         let name = top.dest.isNew ? "新线程·\(top.dest.title)" : top.dest.title
-        if top.probability < Clef.preselectThreshold {
+        if !Clef.shouldPreselect(r.ranked) {
             clefLine = "✨ Clef 拿不准（最高 \(pct)%），⌘K 看候选排序"
             renderChip()
         } else if userPicked {

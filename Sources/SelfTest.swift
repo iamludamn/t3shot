@@ -75,6 +75,7 @@ enum SelfTest {
         images()
         candidates()
         toml()
+        preselect()
         await rankRequestAndParsing()
         await rankErrors()
         await wranglerRefresh()
@@ -148,6 +149,20 @@ enum SelfTest {
         check(zip(threads, threads.dropFirst()).allSatisfy { ($0.updatedAt ?? .distantPast) >= ($1.updatedAt ?? .distantPast) }, "线程按最近更新排序")
         check(c.prefix(40).allSatisfy { $0.isNew }, "新线程入口排在前面")
         check(!c.prefix(40).contains { $0.needsSetup } || all.filter { $0.isNew }.count <= 40, "还没入口的项目排在已有入口之后")
+    }
+
+    // MARK: 3b 预选规则
+
+    static func preselect() {
+        group("预选规则（第一名 ≥ 40% 且领先第二名 ≥ 10 个百分点）")
+        func r(_ ps: [Double]) -> [ClefSuggestion] { ps.enumerated().map { ClefSuggestion(dest: thread("t\($0.offset)", "线程\($0.offset)"), probability: $0.element) } }
+        check(Clef.shouldPreselect(r([0.49, 0.37])), "真实数据 49% / 37%：预选")
+        check(Clef.shouldPreselect(r([0.80, 0.15])), "80% / 15%：预选")
+        check(Clef.shouldPreselect(r([0.40])), "只有一个候选 40%：预选")
+        check(!Clef.shouldPreselect(r([0.45, 0.44])), "45% / 44%：太接近，不预选")
+        check(!Clef.shouldPreselect(r([0.30, 0.10])), "30% / 10%：第一名太低，不预选")
+        check(!Clef.shouldPreselect(r([0.39, 0.05])), "39% 刚好不到 40%：不预选")
+        check(!Clef.shouldPreselect([]), "没有候选：不预选")
     }
 
     // MARK: 4 toml

@@ -33,8 +33,16 @@ enum Clef {
         return m == "clef-flash" ? "clef-flash" : "clef"
     }
     static let credsPath = NSString(string: "~/.config/t3shot/cloudflare.json").expandingTildeInPath
-    /// 最高概率达到它才自动预选到胶囊上；低于它只在选择器里排序展示，不改动当前目标
-    static let preselectThreshold = 0.5
+    /// 预选规则：第一名至少 40%，并且领先第二名至少 10 个百分点。
+    /// 真实数据里两个相近的候选常常是 49% / 37%，只看绝对值（50%）几乎永远预选不上；只看领先又会在 8% / 2% 时误选。
+    static let preselectMinTop = 0.40
+    static let preselectMinMargin = 0.10
+    /// 选择器里「Clef 推荐」只列概率不低于它的候选
+    static let minListedProbability = 0.05
+    static func shouldPreselect(_ ranked: [ClefSuggestion]) -> Bool {
+        guard let top = ranked.first, top.probability >= preselectMinTop else { return false }
+        return top.probability - (ranked.dropFirst().first?.probability ?? 0) >= preselectMinMargin - 1e-9
+    }
     static let timeout: TimeInterval = 15
 
     /// cloudflare.json 有两种写法：

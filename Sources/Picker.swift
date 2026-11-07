@@ -197,6 +197,11 @@ final class PickerController: NSObject, NSSearchFieldDelegate, NSPopoverDelegate
             if a.isActive != b.isActive { return a.isActive }
             return (a.updatedAt ?? .distantPast) > (b.updatedAt ?? .distantPast)
         }
+        // Clef 推荐：概率 ≥ 5% 的前 4 名（再低的只是噪声）；已经在这一组里的不再重复出现在下面的分组
+        let live = Directory.shared.destinations
+        let recommended: [Destination] = q.isEmpty
+            ? suggestions.filter { $0.probability >= Clef.minListedProbability }.prefix(4).compactMap { s in live.first { $0.key == s.dest.key } } : []
+        let recKeys = Set(recommended.map(\.key))
         var out: [Row] = []
         func section(_ i: Int, _ title: String, _ sub: String, _ items: [Destination], limit: Int) {
             guard !items.isEmpty else { return }
@@ -211,16 +216,14 @@ final class PickerController: NSObject, NSSearchFieldDelegate, NSPopoverDelegate
         }
         // Clef 按截图内容排出的候选放最上面（搜索时不显示）
         if q.isEmpty, !suggestions.isEmpty {
-            let live = Directory.shared.destinations
-            let top = suggestions.prefix(4).compactMap { s in live.first { $0.key == s.dest.key } }
-            if !top.isEmpty {
+            if !recommended.isEmpty {
                 out.append(.header("Clef 推荐", "按截图内容排序 · 由你确认"))
-                out += top.map { .dest($0) }
+                out += recommended.map { .dest($0) }
             }
         }
-        section(0, "新线程", "经项目的 scheduler webhook", news, limit: 3)
+        section(0, "新线程", "经项目的 scheduler webhook", news.filter { !recKeys.contains($0.key) }, limit: 3)
         let active = threads.filter { $0.isActive }.count
-        section(1, "跟进线程", active > 0 ? "\(active) 个运行中 · 其余空闲" : "未 settle 的空闲线程", threads, limit: 4)
+        section(1, "跟进线程", active > 0 ? "\(active) 个运行中 · 其余空闲" : "未 settle 的空闲线程", threads.filter { !recKeys.contains($0.key) }, limit: 4)
         if out.isEmpty { out.append(.empty(q.isEmpty ? "没有可投递的目标" : "没有匹配「\(q)」的项目或线程")) }
         return out
     }
