@@ -297,6 +297,8 @@ struct Destination {
     let updatedAt: Date?
     var byAgent = false        // agent 派生出来的线程（委派、子任务）：默认收起，展开或搜索时才出现
     var detail = ""            // 项目的工作目录：给 Clef 判断「这张图属于哪个项目」用
+    var taskId: String?        // 新线程入口对应的 scheduler 任务：投递前用它把过期的 prompt 同步成当前版本
+    var taskPrompt: String?
 
     static let activeStatuses: Set<String> = ["preparing", "queued", "starting", "running", "waiting"]
     var key: String {
@@ -422,6 +424,8 @@ final class Directory {
                         var d = Destination(env: h, kind: .newThread(webhook: url, taskTitle: t["title"] as? String ?? "webhook"),
                                             title: pname, project: pname, projectId: pid, updatedAt: nil)
                         d.detail = roots[pid] ?? ""
+                        d.taskId = t["scheduledTaskId"] as? String
+                        d.taskPrompt = t["prompt"] as? String
                         return d
                     }
                 }
@@ -504,6 +508,19 @@ enum ProjectSetup {
     截图批注如下：
     {{body.note}}
     """
+
+    /// 旧版 T3Shot 建任务时写入的长模板，特征句固定。只有认得出的 T3Shot 模板才会被同步，用户手改过的 prompt 不动。
+    static let legacyPromptMarkers = ["收到一条来自 T3Shot 的截图批注"]
+    static func isStalePrompt(_ p: String?) -> Bool {
+        guard let p, p != prompt else { return false }
+        return legacyPromptMarkers.contains { p.contains($0) }
+    }
+    /// 已有入口的项目：任务里还是旧长模板时，投递前改成精简版（顺带把旧任务名换成新名字）。尽力而为，失败不影响投递。
+    @discardableResult
+    static func syncStalePrompt(_ d: Destination) async -> Bool {
+        guard let id = d.taskId, isStalePrompt(d.taskPrompt) else { return false }
+        return (try? await d.env.client.call("schedule_task", ["scheduledTaskId": id, "prompt": prompt, "title": taskTitle])) != nil
+    }
 
     struct Model { let selection: [String: String]; let source: String }
 
@@ -614,6 +631,7 @@ enum Delivery {
 
         switch d.kind {
         case .newThread(let webhook, _):
+            await ProjectSetup.syncStalePrompt(d)
             let payload: [String: Any] = [
                 "source": "t3shot", "note": note, "host": host,
                 "created_at": ISO8601DateFormatter().string(from: started),

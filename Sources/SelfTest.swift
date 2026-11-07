@@ -72,6 +72,7 @@ enum SelfTest {
     static func run() async -> Int32 {
         Clef.session = stubSession()
         redaction()
+        stalePrompt()
         images()
         await rendering()
         candidates()
@@ -83,6 +84,17 @@ enum SelfTest {
         await wranglerRefresh()
         print("\n结果：\(passed) 通过，\(failed) 失败")
         return failed == 0 ? 0 : 1
+    }
+
+    // MARK: 0 已有入口任务的 prompt 同步
+
+    static func stalePrompt() {
+        group("webhook 任务 prompt 同步（只改认得出的旧模板）")
+        let old = "收到一条来自 T3Shot 的截图批注（来源 {{body.host}}）。当前工作目录就是这个项目。\n请按顺序做：…"
+        check(ProjectSetup.isStalePrompt(old), "旧长模板 → 需要同步")
+        check(!ProjectSetup.isStalePrompt(ProjectSetup.prompt), "已是当前版本 → 不动")
+        check(!ProjectSetup.isStalePrompt("用户自己写的 prompt：{{body.note}}"), "用户手改过的 → 不动")
+        check(!ProjectSetup.isStalePrompt(nil), "读不到 prompt → 不动")
     }
 
     // MARK: 1 脱敏
