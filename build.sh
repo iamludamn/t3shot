@@ -26,7 +26,7 @@ PLIST
 # 有开发者证书就用它签名：签名身份稳定，「屏幕录制」授权不会因为重新编译而失效；否则 ad-hoc。
 IDENT=$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/Apple Development|Developer ID/{print $2; exit}')
 codesign --force --sign "${IDENT:--}" "$APP" >/dev/null 2>&1 || codesign --force --sign - "$APP" >/dev/null 2>&1 || true
-echo "已生成：$APP（签名：${IDENT:-ad-hoc}）"
+echo "已生成：${APP}（签名：${IDENT:-ad-hoc}）"
 if [ "$INSTALL" = 1 ]; then
   pkill -x T3Shot 2>/dev/null || true
   "$APP/Contents/MacOS/T3Shot" --install-agent
