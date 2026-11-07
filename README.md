@@ -58,6 +58,16 @@ T3Shot --rank 截图.png --note "登录页按钮错位"                # 只打�
 
 默认模型 `clef`（27B）；`T3SHOT_CLEF_MODEL=clef-flash` 换成更快的 9B（上下文 24k，候选很多时可能放不下）。没有凭证时整个功能静默关闭。隐私：截图、说明、候选线程标题和几十个字的消息摘录会发到 Cloudflare Workers AI，Clef 为零数据保留。
 
+## 测试
+
+```bash
+tests/run.sh          # 编译 + 离线自检（--selftest）：脱敏、图片预处理、候选筛选、请求体、响应解析与错误、wrangler 续期，全部用桩，不连网
+tests/run.sh --live   # 再用真实 Cloudflare 和真实 T3 线程跑 --rank，断言有候选、有合理的最高概率、耗时 ≤ 20s
+tests/run.sh --gui    # 再起批注窗口：等 Clef 判断完，断言胶囊带 ✨ 概率，把窗口和 ⌘K 选择器存成 docs/test/*.png
+```
+
+界面快照用 `cacheDisplay` 渲染，不需要屏幕录制权限，也不会投递任何东西。需要手动验证的部分：⌘↵ 真正发送、Clef 预选之后手动改选、说明改动后 1.5 秒重新判断。
+
 ## 构建与安装
 
 需要 macOS 26+ 和 Xcode。

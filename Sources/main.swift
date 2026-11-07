@@ -8,6 +8,7 @@
 //   T3Shot --send <目标> --image 文件 [--note 说明]   无界面投递（<目标> 是 --list 里的 key 或标题片段）
 //   T3Shot --cf-auth <账号 ID>     从标准输入读 Cloudflare API token，存到 ~/.config/t3shot/cloudflare.json（0600），启用 Clef 看图判断目标
 //   T3Shot --cf-wrangler <账号 ID> 用 wrangler 的 OAuth 登录态（自动续期，免建 API token）
+//   T3Shot --selftest             离线自检（桩掉 Cloudflare 和 T3），全部通过退出码 0
 //   T3Shot --rank 图片 [--note 说明]   用 Clef 给图片判断目标，打印候选概率排序（不投递）
 //   T3Shot --install-agent        安装登录启动项（LaunchAgent）
 //   T3Shot --demo                 录屏用的自动演示（见 Demo.swift）
@@ -61,6 +62,11 @@ if let target = take("--send") {
         let r = try await Delivery.deliver(d, note: note, png: png, fileName: (image as NSString).lastPathComponent)
         print("OK: \(r.message)"); if let l = r.link { print("LINK: \(l.absoluteString)") }
     }
+}
+
+if has("--selftest") {
+    Task { exit(await SelfTest.run()) }
+    dispatchMain()
 }
 
 if let account = take("--cf-wrangler") {

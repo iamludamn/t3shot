@@ -166,6 +166,14 @@ final class PickerController: NSObject, NSSearchFieldDelegate, NSPopoverDelegate
     /// 父窗口被提到较高层级时，弹出层跟着提上去
     func raise() { vc.view.window?.level = .popUpMenu }
 
+    /// 自检：把选择器的内容渲染成 PNG（不需要屏幕录制权限）
+    func snapshotPNG() -> Data? {
+        let v = vc.view
+        guard let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { return nil }
+        v.cacheDisplay(in: v.bounds, to: rep)
+        return rep.representation(using: .png, properties: [:])
+    }
+
     /// Clef 的结果在选择器打开之后才回来时，原地更新
     func update(suggestions s: [ClefSuggestion]) { suggestions = s; rebuild() }
 

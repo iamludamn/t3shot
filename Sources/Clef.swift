@@ -29,7 +29,7 @@ struct ClefResult {
 
 enum Clef {
     static var model: String {
-        let m = ProcessInfo.processInfo.environment["T3SHOT_CLEF_MODEL"] ?? "clef"
+        let m = getenv("T3SHOT_CLEF_MODEL").map { String(cString: $0) } ?? "clef"
         return m == "clef-flash" ? "clef-flash" : "clef"
     }
     static let credsPath = NSString(string: "~/.config/t3shot/cloudflare.json").expandingTildeInPath
@@ -42,8 +42,8 @@ enum Clef {
     ///   {"accountId":"…","source":"wrangler"} 用 wrangler 的 OAuth 登录态，access token 约 1 小时过期，T3Shot 自己用 refresh token 续期并写回
     struct Creds { let accountId: String; let token: String?; let useWrangler: Bool }
     static var creds: Creds? {
-        let env = ProcessInfo.processInfo.environment
-        if let a = env["CLOUDFLARE_ACCOUNT_ID"], let t = env["CLOUDFLARE_AUTH_TOKEN"], !a.isEmpty, !t.isEmpty { return Creds(accountId: a, token: t, useWrangler: false) }
+        func env(_ k: String) -> String? { getenv(k).map { String(cString: $0) } }
+        if let a = env("CLOUDFLARE_ACCOUNT_ID"), let t = env("CLOUDFLARE_AUTH_TOKEN"), !a.isEmpty, !t.isEmpty { return Creds(accountId: a, token: t, useWrangler: false) }
         guard let d = FileManager.default.contents(atPath: credsPath),
               let j = try? JSONSerialization.jsonObject(with: d) as? [String: String], let a = j["accountId"], !a.isEmpty else { return nil }
         if j["source"] == "wrangler" { return Creds(accountId: a, token: nil, useWrangler: true) }
@@ -64,18 +64,20 @@ enum Clef {
     // MARK: wrangler 登录态续期
 
     /// wrangler 的配置文件位置：macOS 在 ~/Library/Preferences/.wrangler，Linux 在 ~/.config/.wrangler
+    nonisolated(unsafe) static var wranglerPathOverride: String? = nil
     static var wranglerConfigPath: String {
+        if let o = wranglerPathOverride { return o }
         let mac = NSString(string: "~/Library/Preferences/.wrangler/config/default.toml").expandingTildeInPath
         if FileManager.default.fileExists(atPath: mac) { return mac }
         return NSString(string: "~/.config/.wrangler/config/default.toml").expandingTildeInPath
     }
 
-    private static func tomlField(_ name: String, _ txt: String) -> String? {
+    static func tomlField(_ name: String, _ txt: String) -> String? {
         guard let re = try? NSRegularExpression(pattern: "^\(name) *= *\"([^\"]*)\"", options: .anchorsMatchLines),
               let m = re.firstMatch(in: txt, range: NSRange(txt.startIndex..., in: txt)), let r = Range(m.range(at: 1), in: txt) else { return nil }
         return String(txt[r])
     }
-    private static func setTomlField(_ name: String, _ value: String, _ txt: inout String) {
+    static func setTomlField(_ name: String, _ value: String, _ txt: inout String) {
         guard let re = try? NSRegularExpression(pattern: "^\(name) *= *\"[^\"]*\"", options: .anchorsMatchLines) else { return }
         txt = re.stringByReplacingMatches(in: txt, range: NSRange(txt.startIndex..., in: txt),
                                           withTemplate: NSRegularExpression.escapedTemplate(for: "\(name) = \"\(value)\""))
@@ -98,7 +100,7 @@ enum Clef {
             var c = URLComponents(); c.queryItems = [URLQueryItem(name: "grant_type", value: "refresh_token"), URLQueryItem(name: "refresh_token", value: refresh),
                                                       URLQueryItem(name: "client_id", value: "54d11594-84e4-41aa-b438-e81b8fa78ee7")]
             req.httpBody = Data((c.percentEncodedQuery ?? "").utf8)
-            let (data, resp) = try await URLSession.shared.data(for: req)
+            let (data, resp) = try await Clef.session.data(for: req)
             guard (resp as? HTTPURLResponse)?.statusCode == 200,
                   let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let newAccess = j["access_token"] as? String else {
                 throw T3Error("wrangler 登录态续期失败，重新运行 wrangler login")
@@ -138,8 +140,26 @@ enum Clef {
     }
     private static let cache = Cache()
 
+    /// 发给第三方之前把像密钥的片段抹掉：常见的 API key 前缀、Bearer / token= 后面的值、长十六进制或 base64 串
+    static func redact(_ s: String) -> String {
+        let patterns = [
+            #"(?i)\b(sk|pk|rk|ghp|gho|ghs|github_pat|xox[abprs]|glpat|npm|cfut|cfk)[-_][A-Za-z0-9_\-]{10,}"#,
+            #"\bAKIA[0-9A-Z]{16}\b|\bAIza[0-9A-Za-z_\-]{30,}"#,
+            #"(?i)\bbearer\s+[A-Za-z0-9._~+/\-]{8,}=*"#,
+            #"(?i)(token|api[_-]?key|secret|password|passwd|authorization)["']?\s*[:=]\s*["']?[^\s"',;]{6,}"#,
+            #"\b[A-Fa-f0-9]{32,}\b"#,
+            #"\b(?=[A-Za-z0-9+_\-]*[A-Z])(?=[A-Za-z0-9+_\-]*[a-z])(?=[A-Za-z0-9+_\-]*\d)[A-Za-z0-9+_\-]{40,}={0,2}"#,
+        ]
+        var out = s
+        for p in patterns {
+            guard let re = try? NSRegularExpression(pattern: p) else { continue }
+            out = re.stringByReplacingMatches(in: out, range: NSRange(out.startIndex..., in: out), withTemplate: "[redacted]")
+        }
+        return out
+    }
+
     private static func oneLine(_ s: Any?, _ n: Int) -> String {
-        let t = (s as? String ?? "").replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
+        let t = redact((s as? String ?? "").replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces))
         return t.count > n ? String(t.prefix(n)) + "…" : t
     }
 
@@ -209,6 +229,11 @@ enum Clef {
     Thread descriptions are in whatever language the user wrote them in.
     """
 
+    /// 网络层可替换：离线自检用 URLProtocol 桩替换成假的 Cloudflare
+    nonisolated(unsafe) static var session: URLSession = .shared
+    /// 候选线程摘要的来源可替换：自检时不连 T3
+    nonisolated(unsafe) static var digestProvider: (@Sendable (Destination) async -> String?)? = nil
+
     static func rank(png: Data, note: String, candidates: [Destination]) async throws -> ClefResult {
         guard let creds else { throw T3Error("没有配置 Cloudflare 凭证") }
         guard let b64 = prepareImage(png) else { throw T3Error("截图无法转成 Clef 接受的格式") }
@@ -216,7 +241,7 @@ enum Clef {
         // 先把线程摘要凑齐（命中缓存很快；没命中的最多等几秒）
         var digests: [String: String] = [:]
         await withTaskGroup(of: (String, String?).self) { g in
-            for d in candidates.prefix(30) where !d.isNew { g.addTask { (d.key, await digest(d)) } }
+            for d in candidates.prefix(30) where !d.isNew { g.addTask { (d.key, await (digestProvider?(d) ?? digest(d))) } }
             for await (k, v) in g { if let v, !v.isEmpty { digests[k] = v } }
         }
         var criteria: [String: Any] = [:]
@@ -237,7 +262,7 @@ enum Clef {
         let body: [String: Any] = [
             "model": model,
             "images": [["content_type": "image/jpeg", "base64": b64]],
-            "state": ["user_note": note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "(no note)" : note],
+            "state": ["user_note": note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "(no note)" : redact(note)],
             "questions": ["target": ["type": "choice", "instructions": instructions, "criteria": criteria]],
         ]
         let token = try await accessToken(creds)
@@ -248,7 +273,7 @@ enum Clef {
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue(t3UserAgent, forHTTPHeaderField: "User-Agent")
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        let (data, resp) = try await session.data(for: req)
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
         let raw = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
         // REST 接口把结果包在 result 里；Workers 绑定直接返回结果
