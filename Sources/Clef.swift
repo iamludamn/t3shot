@@ -3,8 +3,9 @@
 // 做法：把批注后的截图和说明作为 state，把所有候选（已有线程 + 各项目的「新建线程」）作为一个 Choice 问题的选项，
 // Clef 返回每个选项的概率。T3Shot 只用它排序和预选，不自动发送——始终由人确认。
 //
-// 凭证：环境变量 CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_AUTH_TOKEN（需要 Workers AI 权限），或 ~/.config/t3shot/cloudflare.json
-// （0600，用 `T3Shot --cf-auth <账号 ID>` 从标准输入读 token 写入）。没有凭证时整个功能静默关闭。
+// 凭证：环境变量 CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_AUTH_TOKEN（需要 Workers AI 权限），或 ~/.config/t3shot/cloudflare.json（0600）：
+//   `T3Shot --cf-auth <账号 ID>` 从标准输入读 API token；`T3Shot --cf-wrangler <账号 ID>` 直接用 wrangler 的 OAuth 登录态并自动续期。
+// 没有凭证时整个功能静默关闭。
 // 模型：默认 clef（27B，上下文 65k）；T3SHOT_CLEF_MODEL=clef-flash 换成更快的 9B（上下文 24k）。
 // 隐私：截图、说明、候选线程的标题和几十个字的消息摘录会发给 Cloudflare Workers AI（Clef 为零数据保留）。
 import AppKit
@@ -36,23 +37,86 @@ enum Clef {
     static let preselectThreshold = 0.5
     static let timeout: TimeInterval = 15
 
-    struct Creds { let accountId: String; let token: String }
+    /// cloudflare.json 有两种写法：
+    ///   {"accountId":"…","token":"…"}         固定 token（API token 不会过期）
+    ///   {"accountId":"…","source":"wrangler"} 用 wrangler 的 OAuth 登录态，access token 约 1 小时过期，T3Shot 自己用 refresh token 续期并写回
+    struct Creds { let accountId: String; let token: String?; let useWrangler: Bool }
     static var creds: Creds? {
         let env = ProcessInfo.processInfo.environment
-        if let a = env["CLOUDFLARE_ACCOUNT_ID"], let t = env["CLOUDFLARE_AUTH_TOKEN"], !a.isEmpty, !t.isEmpty { return Creds(accountId: a, token: t) }
+        if let a = env["CLOUDFLARE_ACCOUNT_ID"], let t = env["CLOUDFLARE_AUTH_TOKEN"], !a.isEmpty, !t.isEmpty { return Creds(accountId: a, token: t, useWrangler: false) }
         guard let d = FileManager.default.contents(atPath: credsPath),
-              let j = try? JSONSerialization.jsonObject(with: d) as? [String: String],
-              let a = j["accountId"], let t = j["token"], !a.isEmpty, !t.isEmpty else { return nil }
-        return Creds(accountId: a, token: t)
+              let j = try? JSONSerialization.jsonObject(with: d) as? [String: String], let a = j["accountId"], !a.isEmpty else { return nil }
+        if j["source"] == "wrangler" { return Creds(accountId: a, token: nil, useWrangler: true) }
+        guard let t = j["token"], !t.isEmpty else { return nil }
+        return Creds(accountId: a, token: t, useWrangler: false)
     }
     static var isConfigured: Bool { creds != nil }
 
-    static func saveCreds(accountId: String, token: String) throws {
+    static func saveCreds(accountId: String, token: String?) throws {
         let dir = (credsPath as NSString).deletingLastPathComponent
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        let data = try JSONSerialization.data(withJSONObject: ["accountId": accountId, "token": token], options: [.prettyPrinted, .sortedKeys])
+        let obj: [String: String] = token.map { ["accountId": accountId, "token": $0] } ?? ["accountId": accountId, "source": "wrangler"]
+        let data = try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
         guard FileManager.default.createFile(atPath: credsPath, contents: data, attributes: [.posixPermissions: 0o600]) else { throw T3Error("写入凭证失败") }
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: credsPath)
+    }
+
+    // MARK: wrangler 登录态续期
+
+    /// wrangler 的配置文件位置：macOS 在 ~/Library/Preferences/.wrangler，Linux 在 ~/.config/.wrangler
+    static var wranglerConfigPath: String {
+        let mac = NSString(string: "~/Library/Preferences/.wrangler/config/default.toml").expandingTildeInPath
+        if FileManager.default.fileExists(atPath: mac) { return mac }
+        return NSString(string: "~/.config/.wrangler/config/default.toml").expandingTildeInPath
+    }
+
+    private static func tomlField(_ name: String, _ txt: String) -> String? {
+        guard let re = try? NSRegularExpression(pattern: "^\(name) *= *\"([^\"]*)\"", options: .anchorsMatchLines),
+              let m = re.firstMatch(in: txt, range: NSRange(txt.startIndex..., in: txt)), let r = Range(m.range(at: 1), in: txt) else { return nil }
+        return String(txt[r])
+    }
+    private static func setTomlField(_ name: String, _ value: String, _ txt: inout String) {
+        guard let re = try? NSRegularExpression(pattern: "^\(name) *= *\"[^\"]*\"", options: .anchorsMatchLines) else { return }
+        txt = re.stringByReplacingMatches(in: txt, range: NSRange(txt.startIndex..., in: txt),
+                                          withTemplate: NSRegularExpression.escapedTemplate(for: "\(name) = \"\(value)\""))
+    }
+
+    /// 串行化：refresh token 每次刷新都会轮换，并发刷新会把对方的 refresh token 作废
+    private actor WranglerToken {
+        func current() async throws -> String {
+            let path = Clef.wranglerConfigPath
+            guard var txt = try? String(contentsOfFile: path, encoding: .utf8),
+                  let access = Clef.tomlField("oauth_token", txt), let refresh = Clef.tomlField("refresh_token", txt) else {
+                throw T3Error("找不到 wrangler 登录态（\(path)），先运行 wrangler login")
+            }
+            if let exp = parseISO(Clef.tomlField("expiration_time", txt)), exp.timeIntervalSinceNow > 120 { return access }
+            // 过期了：用 wrangler 自己的 OAuth 客户端续期
+            var req = URLRequest(url: URL(string: "https://dash.cloudflare.com/oauth2/token")!, timeoutInterval: 15)
+            req.httpMethod = "POST"
+            req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+            req.setValue(t3UserAgent, forHTTPHeaderField: "User-Agent")
+            var c = URLComponents(); c.queryItems = [URLQueryItem(name: "grant_type", value: "refresh_token"), URLQueryItem(name: "refresh_token", value: refresh),
+                                                      URLQueryItem(name: "client_id", value: "54d11594-84e4-41aa-b438-e81b8fa78ee7")]
+            req.httpBody = Data((c.percentEncodedQuery ?? "").utf8)
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            guard (resp as? HTTPURLResponse)?.statusCode == 200,
+                  let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let newAccess = j["access_token"] as? String else {
+                throw T3Error("wrangler 登录态续期失败，重新运行 wrangler login")
+            }
+            let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            Clef.setTomlField("oauth_token", newAccess, &txt)
+            if let r = j["refresh_token"] as? String { Clef.setTomlField("refresh_token", r, &txt) }
+            Clef.setTomlField("expiration_time", f.string(from: Date().addingTimeInterval((j["expires_in"] as? Double) ?? 3600)), &txt)
+            try txt.write(toFile: path, atomically: true, encoding: .utf8)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)   // 原子写入会换成默认权限
+            return newAccess
+        }
+    }
+    private static let wrangler = WranglerToken()
+
+    static func accessToken(_ c: Creds) async throws -> String {
+        if let t = c.token { return t }
+        return try await wrangler.current()
     }
 
     // MARK: 候选
@@ -176,11 +240,12 @@ enum Clef {
             "state": ["user_note": note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "(no note)" : note],
             "questions": ["target": ["type": "choice", "instructions": instructions, "criteria": criteria]],
         ]
+        let token = try await accessToken(creds)
         let url = URL(string: "https://api.cloudflare.com/client/v4/accounts/\(creds.accountId)/ai/run/@cf/cloudflare/\(model)")!
         var req = URLRequest(url: url, timeoutInterval: timeout)
         req.httpMethod = "POST"
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        req.setValue("Bearer \(creds.token)", forHTTPHeaderField: "Authorization")
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue(t3UserAgent, forHTTPHeaderField: "User-Agent")
         let (data, resp) = try await URLSession.shared.data(for: req)

@@ -52,6 +52,7 @@ T3Shot --pair https://prod-xxxx.t3coderelay.com <配对码>
 
 ```bash
 echo "$CLOUDFLARE_AUTH_TOKEN" | T3Shot --cf-auth <账号 ID>   # 存到 ~/.config/t3shot/cloudflare.json（0600）；也可用环境变量 CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_AUTH_TOKEN
+T3Shot --cf-wrangler <账号 ID>                              # 不建 API token，直接用 wrangler 的 OAuth 登录态（access token 约 1 小时过期，T3Shot 用 refresh token 自动续期并写回 wrangler 配置，和 wrangler 共用同一份）
 T3Shot --rank 截图.png --note "登录页按钮错位"                # 只打印候选概率排序，用来调试，不投递
 ```
 
