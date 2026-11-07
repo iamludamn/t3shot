@@ -9,7 +9,7 @@ final class Canvas: NSView {
     let image: NSImage
     let iw: CGFloat, ih: CGFloat
     var marks: [Mark] = []
-    var tool = 0                    // 0 画笔 1 矩形
+    var tool = 0                    // 0 矩形（默认）1 画笔（手动切换）
     var current: Mark?
     private var startPt = CGPoint.zero
 
@@ -79,12 +79,12 @@ final class Canvas: NSView {
     override func resetCursorRects() { addCursorRect(bounds, cursor: .crosshair) }
     override func mouseDown(with e: NSEvent) {
         startPt = imagePoint(e)
-        current = tool == 0 ? .pen([startPt]) : .rect(CGRect(origin: startPt, size: .zero))
+        current = tool == 1 ? .pen([startPt]) : .rect(CGRect(origin: startPt, size: .zero))
         needsDisplay = true
     }
     override func mouseDragged(with e: NSEvent) {
         let p = imagePoint(e)
-        if tool == 0, case .pen(var pts)? = current { pts.append(p); current = .pen(pts) }
+        if tool == 1, case .pen(var pts)? = current { pts.append(p); current = .pen(pts) }
         else { current = .rect(CGRect(x: min(startPt.x, p.x), y: min(startPt.y, p.y), width: abs(p.x - startPt.x), height: abs(p.y - startPt.y))) }
         needsDisplay = true
     }
@@ -259,10 +259,10 @@ final class AnnotateController: NSObject, NSWindowDelegate {
 
     private func buildToolbar() -> NSView {
         let barH: CGFloat = 46
-        let seg = NSSegmentedControl(images: [UI.symbol("pencil"), UI.symbol("rectangle")].compactMap { $0 },
+        let seg = NSSegmentedControl(images: [UI.symbol("rectangle"), UI.symbol("pencil")].compactMap { $0 },
                                      trackingMode: .selectOne, target: self, action: #selector(toolChanged(_:)))
         seg.selectedSegment = 0
-        seg.setToolTip("画笔", forSegment: 0); seg.setToolTip("矩形", forSegment: 1)
+        seg.setToolTip("矩形（默认）", forSegment: 0); seg.setToolTip("画笔（手动画线）", forSegment: 1)
         seg.setWidth(44, forSegment: 0); seg.setWidth(44, forSegment: 1)
         seg.controlSize = .large
         if #available(macOS 26, *) { seg.borderShape = .capsule }
@@ -459,7 +459,7 @@ final class AnnotateController: NSObject, NSWindowDelegate {
             chip.image = UI.symbol("circle.fill", 9, colors: [d.isActive ? .systemGreen : .tertiaryLabelColor])
             chip.title = "\(d.isActive ? "跟进" : "继续") · \(d.title)" + clefBadge(d)
             sendBtn.title = d.isActive ? "排队跟进" : "发送"
-            hint(d.isActive ? "\(d.statusText)：作为下一轮 follow-up 排队，不打断当前任务" : "线程空闲：立即开始新一轮" + (d.env.direct ? "" : "（经链接，仅文字）"))
+            hint(d.isActive ? "\(d.statusText)：作为下一轮 follow-up 排队，不打断当前任务" : "线程空闲：立即开始新一轮" + (d.env.direct ? "" : "（该环境未配对，图片传不过去，无法发送）"))
         }
         chip.toolTip = "\(d.isNew ? "新线程" : d.statusText) · \(d.env.label)\(d.project.isEmpty ? "" : " · \(d.project)")\n选择投递目标  ⌘K"
     }

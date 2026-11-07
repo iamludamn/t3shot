@@ -272,8 +272,8 @@ final class PickerController: NSObject, NSSearchFieldDelegate, NSPopoverDelegate
         footer.stringValue = envs.map { e in
             let state = e.online ? (e.direct ? "●" : "◐") : "○"
             return "\(state) \(e.label)" + (e.online ? "" : " 离线")
-        }.joined(separator: "   ") + (envs.contains { !$0.direct && $0.online } ? "   ◐ = 经链接，仅文字" : "")
-        footer.toolTip = envs.map { "\($0.label)：\($0.online ? "在线" : ($0.error ?? "离线"))\($0.direct ? "，已配对（可传图）" : "，经本机 T3 链接转发（仅文字）")" }.joined(separator: "\n")
+        }.joined(separator: "   ") + (envs.contains { !$0.direct && $0.online } ? "   ◐ = 未配对，不能投递" : "")
+        footer.toolTip = envs.map { "\($0.label)：\($0.online ? "在线" : ($0.error ?? "离线"))\($0.direct ? "，已配对（可传图）" : "，未配对：图片传不过去，不能投递")" }.joined(separator: "\n")
     }
 
     private func select(_ i: Int, scroll doScroll: Bool) {
