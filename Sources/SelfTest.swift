@@ -76,6 +76,7 @@ enum SelfTest {
         candidates()
         toml()
         preselect()
+        shiftChord()
         await rankRequestAndParsing()
         await rankErrors()
         await wranglerRefresh()
@@ -163,6 +164,55 @@ enum SelfTest {
         check(!Clef.shouldPreselect(r([0.30, 0.10])), "30% / 10%：第一名太低，不预选")
         check(!Clef.shouldPreselect(r([0.39, 0.05])), "39% 刚好不到 40%：不预选")
         check(!Clef.shouldPreselect([]), "没有候选：不预选")
+    }
+
+    // MARK: 3c 左右 Shift 同时按
+
+    static func shiftChord() {
+        group("左右 Shift 同时按（状态机）")
+        let t0 = Date(timeIntervalSince1970: 1_000_000)
+        func at(_ dt: TimeInterval) -> Date { t0.addingTimeInterval(dt) }
+
+        var c = ShiftChord()
+        check(!c.flagsChanged(left: true, right: false, otherModifiers: false, now: at(0)), "先按左 Shift：不触发")
+        check(c.flagsChanged(left: true, right: true, otherModifiers: false, now: at(0.1)), "0.1 秒内再按右 Shift：触发")
+        check(!c.flagsChanged(left: true, right: true, otherModifiers: false, now: at(0.2)), "同一次按住不重复触发")
+
+        c = ShiftChord()
+        _ = c.flagsChanged(left: false, right: true, otherModifiers: false, now: at(0))
+        check(c.flagsChanged(left: true, right: true, otherModifiers: false, now: at(0.15)), "先按右后按左也触发（顺序无关）")
+
+        c = ShiftChord()
+        check(c.flagsChanged(left: true, right: true, otherModifiers: false, now: at(0)), "两个 Shift 在同一个事件里一起按下：触发")
+
+        c = ShiftChord()
+        _ = c.flagsChanged(left: true, right: false, otherModifiers: false, now: at(0))
+        check(!c.flagsChanged(left: true, right: true, otherModifiers: false, now: at(0.6)), "间隔 0.6 秒：算先按住一个再按另一个，不触发")
+
+        c = ShiftChord()
+        _ = c.flagsChanged(left: true, right: false, otherModifiers: false, now: at(0))
+        c.keyDown()
+        check(!c.flagsChanged(left: true, right: true, otherModifiers: false, now: at(0.1)), "两个 Shift 之间按了别的键（打大写）：不触发")
+
+        c = ShiftChord()
+        _ = c.flagsChanged(left: true, right: false, otherModifiers: false, now: at(0))
+        check(!c.flagsChanged(left: true, right: true, otherModifiers: true, now: at(0.1)), "同时按着 ⌘/⌃/⌥：不触发，避免和别的快捷键冲突")
+
+        c = ShiftChord()
+        check(!c.flagsChanged(left: true, right: false, otherModifiers: false, now: at(0)) && !c.flagsChanged(left: false, right: false, otherModifiers: false, now: at(0.1)),
+              "只按一个 Shift 再松开：不触发")
+
+        c = ShiftChord()
+        _ = c.flagsChanged(left: true, right: false, otherModifiers: false, now: at(0))
+        _ = c.flagsChanged(left: true, right: true, otherModifiers: false, now: at(0.1))            // 触发
+        _ = c.flagsChanged(left: true, right: false, otherModifiers: false, now: at(0.3))           // 松开右
+        check(!c.flagsChanged(left: true, right: true, otherModifiers: false, now: at(0.4)), "按住左不放、松紧右：不重复触发")
+        _ = c.flagsChanged(left: false, right: false, otherModifiers: false, now: at(0.5))          // 全松开
+        _ = c.flagsChanged(left: true, right: false, otherModifiers: false, now: at(0.6))
+        check(!c.flagsChanged(left: true, right: true, otherModifiers: false, now: at(0.7)), "触发后 1 秒内再来一次：冷却中，不触发")
+        _ = c.flagsChanged(left: false, right: false, otherModifiers: false, now: at(0.8))
+        _ = c.flagsChanged(left: true, right: false, otherModifiers: false, now: at(2.0))
+        check(c.flagsChanged(left: true, right: true, otherModifiers: false, now: at(2.1)), "过了冷却再按：触发")
     }
 
     // MARK: 4 toml

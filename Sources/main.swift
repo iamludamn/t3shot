@@ -1,7 +1,8 @@
 // T3Shot — 原生 macOS 截图批注工具：⌃⇧4 框选 → 批注 → 投递到任意 T3 环境（新线程 / 跟进已有线程）。
 //
 // 用法：
-//   T3Shot                        常驻菜单栏，⌃⇧4 截图
+//   T3Shot                        常驻菜单栏，左右 Shift 同时按 = 截整个屏幕并批注（⌃⇧4 框选区域）
+//   T3Shot --fullscreen           截下鼠标所在的屏幕并打开批注窗口（单次运行，关掉就退出）
 //   T3Shot --image 文件            直接批注一张图（投递后退出）
 //   T3Shot --pair <T3 地址> <配对码>  配对一个 T3 环境（远端用它的 T3 Connect 地址；本机会自动配对）
 //   T3Shot --list                 列出所有环境和投递目标
@@ -117,6 +118,7 @@ if has("--install-agent") {
 
 let mode: Agent.Mode
 if has("--demo") { mode = .demo }
+else if has("--fullscreen") { mode = .fullscreen }
 else if let image = take("--image") { mode = .single(URL(fileURLWithPath: image)) }
 else if args.isEmpty { mode = .resident }
 else { fputs("未知参数 \(args.joined(separator: " "))\n", stderr); exit(64) }

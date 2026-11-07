@@ -1,4 +1,5 @@
-// Agent.swift — 常驻菜单栏 + 全局快捷键 ⌃⇧4：框选截图 → 批注窗口。
+// Agent.swift — 常驻菜单栏 + 全局快捷键：左右 Shift 同时按 → 直接截下整个屏幕 → 批注窗口（红框圈出要说的内容）。
+// 没有「输入监控」权限时退回 ⌃⇧4（框选区域）。
 import AppKit
 import Carbon.HIToolbox
 
@@ -8,10 +9,11 @@ final class Agent: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem?
     var controllers: [AnnotateController] = []
     var hotKeyRef: EventHotKeyRef?
+    var chordTap: ShiftChordTap?
     let mode: Mode
     var demo: DemoScript?
 
-    enum Mode { case resident, single(URL), demo }
+    enum Mode { case resident, single(URL), fullscreen, demo }
 
     init(mode: Mode) { self.mode = mode; super.init(); Agent.shared = self }
 
@@ -21,66 +23,79 @@ final class Agent: NSObject, NSApplicationDelegate {
         case .resident:
             NSApp.setActivationPolicy(.accessory)
             buildStatusItem()
-            registerHotKey()
+            registerShortcuts()
             Task { await Directory.shared.refresh() }
             // 定时刷新，保证按下快捷键时目标列表已经是热的
             Timer.scheduledTimer(withTimeInterval: 90, repeats: true) { _ in Task { @MainActor in await Directory.shared.refresh() } }
         case .single(let url):
             NSApp.setActivationPolicy(.regular)
             guard let img = NSImage(contentsOf: url) else { fputs("无法读取图片\n", stderr); exit(1) }
-            let c = open(image: img)
-            c.onClose = { NSApp.terminate(nil) }
-            // 自检钩子：T3SHOT_SNAPSHOT=<目录>：等 Clef 判断完（每 0.5 秒看一次，最长 T3SHOT_SNAPSHOT_DELAY 秒，默认 45）后，
-            // 打印胶囊 / 提示行 / 候选数，把批注窗口和 ⌘K 选择器存成 PNG，然后退出。用 cacheDisplay 渲染，不需要屏幕录制权限。
-            let env = ProcessInfo.processInfo.environment
-            if let dir = env["T3SHOT_SNAPSHOT"] {
-                if let n = env["T3SHOT_NOTE"] { c.note.string = n }
-                let maxWait = Double(env["T3SHOT_SNAPSHOT_DELAY"] ?? "") ?? 45
-                Task { @MainActor in
-                    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-                    // 目录刷新 + 线程摘要 + Clef 请求的总时长不固定，固定睡眠会误判；轮询到提示行出现 Clef 的结论（含「不可用」）为止
-                    let t0 = Date()
-                    while Date().timeIntervalSince(t0) < maxWait {
-                        try? await Task.sleep(for: .milliseconds(500))
-                        let s = c.status.stringValue
-                        if s.contains("✨ Clef") && !s.contains("正在看图判断") { break }
-                    }
-                    print(String(format: "CLEF_WAIT=%.1fs", Date().timeIntervalSince(t0)))
-                    print("CHIP=\(c.chip.title)\nSTATUS=\(c.status.stringValue)\nSUGGESTIONS=\(c.suggestions.count)")
-                    for s in c.suggestions.prefix(5) { print(String(format: "RANK %3.0f%% %@", s.probability * 100, (s.dest.isNew ? "新线程·" : "") + s.dest.title)) }
-                    @MainActor func save(_ view: NSView?, _ name: String) {
-                        guard let v = view, let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { return }
-                        v.cacheDisplay(in: v.bounds, to: rep)
-                        try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: dir + "/" + name))
-                    }
-                    save(c.window.contentView, "window.png")
-                    c.openPicker()
-                    try? await Task.sleep(for: .seconds(1.5))
-                    if let png = c.pickerController?.snapshotPNG() { try? png.write(to: URL(fileURLWithPath: dir + "/picker.png")) }
-                    print("SNAPSHOT_DONE")
-                    NSApp.terminate(nil)
-                }
-            }
-            // 自检钩子：按常驻模式的方式自动发送一次（窗口立刻收起、结果走提示），用于脚本验证
-            if let key = ProcessInfo.processInfo.environment["T3SHOT_AUTOSEND_KEY"] {
-                c.dismissOnSend = true
-                c.onClose = { DispatchQueue.main.asyncAfter(deadline: .now() + 10) { NSApp.terminate(nil) } }
-                Task { @MainActor in
-                    await Directory.shared.refresh()
-                    guard let d = Directory.shared.destinations.first(where: { $0.key == key }) else { fputs("找不到目标 \(key)\n", stderr); exit(3) }
-                    c.userPicked = true
-                    c.setDestination(d, remember: false)
-                    c.note.string = ProcessInfo.processInfo.environment["T3SHOT_NOTE"] ?? "T3Shot 自检"
-                    try? await Task.sleep(for: .seconds(1))
-                    fputs("SEND_AT=\(Date().timeIntervalSince1970)\n", stderr)
-                    c.send()
-                    fputs("WINDOW_VISIBLE_AFTER_SEND=\(c.window.isVisible)\n", stderr)
-                }
+            startSingle(img, screen: nil)
+        case .fullscreen:
+            NSApp.setActivationPolicy(.regular)
+            Task { @MainActor in
+                guard let shot = await Agent.grabScreen() else { fputs("截屏失败：需要「屏幕录制」权限\n", stderr); exit(2) }
+                startSingle(shot.image, screen: shot.screen)
             }
         case .demo:
             NSApp.setActivationPolicy(.regular)
             demo = DemoScript()
             demo?.start()
+        }
+    }
+
+
+    /// 单次运行（--image / --fullscreen）：开一个批注窗口，关掉就退出；带测试用的快照和自动发送钩子。
+    func startSingle(_ img: NSImage, screen: NSScreen?) {
+        let c = open(image: img, screen: screen)
+        c.onClose = { NSApp.terminate(nil) }
+        // 自检钩子：T3SHOT_SNAPSHOT=<目录>：等 Clef 判断完（每 0.5 秒看一次，最长 T3SHOT_SNAPSHOT_DELAY 秒，默认 45）后，
+        // 打印胶囊 / 提示行 / 候选数，把批注窗口和 ⌘K 选择器存成 PNG，然后退出。用 cacheDisplay 渲染，不需要屏幕录制权限。
+        let env = ProcessInfo.processInfo.environment
+        if let dir = env["T3SHOT_SNAPSHOT"] {
+            if let n = env["T3SHOT_NOTE"] { c.note.string = n }
+            let maxWait = Double(env["T3SHOT_SNAPSHOT_DELAY"] ?? "") ?? 45
+            Task { @MainActor in
+                try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+                // 目录刷新 + 线程摘要 + Clef 请求的总时长不固定，固定睡眠会误判；轮询到提示行出现 Clef 的结论（含「不可用」）为止
+                let t0 = Date()
+                while Date().timeIntervalSince(t0) < maxWait {
+                    try? await Task.sleep(for: .milliseconds(500))
+                    let s = c.status.stringValue
+                    if s.contains("✨ Clef") && !s.contains("正在看图判断") { break }
+                }
+                print(String(format: "CLEF_WAIT=%.1fs", Date().timeIntervalSince(t0)))
+                print("IMAGE=\(Int(img.size.width))x\(Int(img.size.height))pt")
+                print("CHIP=\(c.chip.title)\nSTATUS=\(c.status.stringValue)\nSUGGESTIONS=\(c.suggestions.count)")
+                for s in c.suggestions.prefix(5) { print(String(format: "RANK %3.0f%% %@", s.probability * 100, (s.dest.isNew ? "新线程·" : "") + s.dest.title)) }
+                @MainActor func save(_ view: NSView?, _ name: String) {
+                    guard let v = view, let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { return }
+                    v.cacheDisplay(in: v.bounds, to: rep)
+                    try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: dir + "/" + name))
+                }
+                save(c.window.contentView, "window.png")
+                c.openPicker()
+                try? await Task.sleep(for: .seconds(1.5))
+                if let png = c.pickerController?.snapshotPNG() { try? png.write(to: URL(fileURLWithPath: dir + "/picker.png")) }
+                print("SNAPSHOT_DONE")
+                NSApp.terminate(nil)
+            }
+        }
+        // 自检钩子：按常驻模式的方式自动发送一次（窗口立刻收起、结果走提示），用于脚本验证
+        if let key = ProcessInfo.processInfo.environment["T3SHOT_AUTOSEND_KEY"] {
+            c.dismissOnSend = true
+            c.onClose = { DispatchQueue.main.asyncAfter(deadline: .now() + 10) { NSApp.terminate(nil) } }
+            Task { @MainActor in
+                await Directory.shared.refresh()
+                guard let d = Directory.shared.destinations.first(where: { $0.key == key }) else { fputs("找不到目标 \(key)\n", stderr); exit(3) }
+                c.userPicked = true
+                c.setDestination(d, remember: false)
+                c.note.string = ProcessInfo.processInfo.environment["T3SHOT_NOTE"] ?? "T3Shot 自检"
+                try? await Task.sleep(for: .seconds(1))
+                fputs("SEND_AT=\(Date().timeIntervalSince1970)\n", stderr)
+                c.send()
+                fputs("WINDOW_VISIBLE_AFTER_SEND=\(c.window.isVisible)\n", stderr)
+            }
         }
     }
 
@@ -113,9 +128,10 @@ final class Agent: NSObject, NSApplicationDelegate {
     func buildStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.button?.image = UI.symbol("camera.viewfinder", 14)
-        item.button?.toolTip = "T3Shot  ⌃⇧4"
+        item.button?.toolTip = "T3Shot  左右 Shift 同时按 = 截整个屏幕"
         let m = NSMenu()
-        let cap = m.addItem(withTitle: "截图并投递到 T3", action: #selector(capture), keyEquivalent: "4"); cap.keyEquivalentModifierMask = [.control, .shift]; cap.target = self
+        let full = m.addItem(withTitle: "截取整个屏幕并批注  ⇧⇧", action: #selector(captureFullScreen), keyEquivalent: ""); full.target = self
+        let cap = m.addItem(withTitle: "框选区域并批注  ⌃⇧4", action: #selector(capture), keyEquivalent: "4"); cap.keyEquivalentModifierMask = [.control, .shift]; cap.target = self
         let r = m.addItem(withTitle: "刷新投递目标", action: #selector(refresh), keyEquivalent: ""); r.target = self
         m.addItem(.separator())
         let envs = m.addItem(withTitle: "环境", action: nil, keyEquivalent: ""); envs.isEnabled = false
@@ -139,7 +155,21 @@ final class Agent: NSObject, NSApplicationDelegate {
 
     @objc func refresh() { Task { await Directory.shared.refresh() } }
 
-    // MARK: 全局快捷键（Carbon RegisterEventHotKey，不需要辅助功能权限）
+    // MARK: 全局快捷键
+
+    /// 主快捷键：左右 Shift 同时按（需要「输入监控」权限）。没权限时先注册 ⌃⇧4 兜底（Carbon，不需要权限），
+    /// 并每 5 秒重试；授权之后 ⇧⇧ 自动生效，⌃⇧4 保留（框选区域）。
+    func registerShortcuts() {
+        let tap = ShiftChordTap { Task { @MainActor in Agent.shared.captureFullScreen() } }
+        chordTap = tap
+        if tap.install(promptForPermission: true) {
+            fputs("快捷键 左右 Shift 同时按 已注册\n", stderr)
+        } else {
+            fputs("没有「输入监控」权限，左右 Shift 暂不可用：先用 ⌃⇧4；授权后自动生效（系统设置 → 隐私与安全性 → 输入监控）\n", stderr)
+            tap.installWithRetry { fputs("左右 Shift 快捷键已生效\n", stderr) }
+        }
+        registerHotKey()      // ⌃⇧4：框选区域
+    }
 
     func registerHotKey() {
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
@@ -171,9 +201,40 @@ final class Agent: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// 直接截下鼠标所在的那块屏幕（不弹十字线）。窗口随后出现在同一块屏幕上，用红框圈要说的内容。
+    @objc func captureFullScreen() {
+        guard !capturing else { return }
+        capturing = true
+        Task { @MainActor in
+            defer { capturing = false }
+            guard let shot = await Agent.grabScreen() else {
+                Toast.shared.show(.error, "截屏失败", detail: "需要「屏幕录制」权限（系统设置 → 隐私与安全性）", hideAfter: 6)
+                return
+            }
+            _ = open(image: shot.image, screen: shot.screen)
+        }
+    }
+
+    /// 鼠标所在的屏幕：用 screencapture -R 按全局坐标截（左上角为原点，主屏左上为 0,0），多块屏幕也对。
+    static func grabScreen() async -> (image: NSImage, screen: NSScreen)? {
+        let loc = NSEvent.mouseLocation
+        guard let screen = NSScreen.screens.first(where: { NSMouseInRect(loc, $0.frame, false) }) ?? NSScreen.main, let primary = NSScreen.screens.first else { return nil }
+        let r = screen.frame
+        let rect = "\(Int(r.minX)),\(Int(primary.frame.height - r.maxY)),\(Int(r.width)),\(Int(r.height))"
+        let tmp = NSTemporaryDirectory() + "t3shot-full-\(Int(Date().timeIntervalSince1970 * 1000)).png"
+        await Task.detached {
+            let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+            p.arguments = ["-x", "-R", rect, tmp]
+            try? p.run(); p.waitUntilExit()
+        }.value
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        guard let img = NSImage(contentsOfFile: tmp), img.isValid, img.size.width > 0 else { return nil }
+        return (img, screen)
+    }
+
     @discardableResult
-    func open(image: NSImage) -> AnnotateController {
-        let c = AnnotateController(image: image)
+    func open(image: NSImage, screen: NSScreen? = nil) -> AnnotateController {
+        let c = AnnotateController(image: image, screen: screen)
         controllers.append(c)
         c.onClose = { [weak self, weak c] in self?.controllers.removeAll { $0 === c } }
         if case .resident = mode { c.dismissOnSend = true }   // 发送即收起，结果走右上角提示

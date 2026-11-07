@@ -181,7 +181,11 @@ final class AnnotateController: NSObject, NSWindowDelegate {
     private var clefDebounce: DispatchWorkItem?
     private var clefAsked = false
 
-    init(image: NSImage) {
+    /// 窗口出现和按比例定大小所在的屏幕（整屏截图时是鼠标所在的那块）；nil 用主屏
+    let targetScreen: NSScreen?
+
+    init(image: NSImage, screen: NSScreen? = nil) {
+        targetScreen = screen
         canvas = Canvas(image: image)
         window = NSWindow(contentRect: .zero, styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
         super.init()
@@ -195,7 +199,11 @@ final class AnnotateController: NSObject, NSWindowDelegate {
     }
 
     func show() {
-        window.center(); window.makeKeyAndOrderFront(nil)
+        window.center()
+        if let vis = targetScreen?.visibleFrame {       // 居中到目标屏幕的可视区
+            window.setFrameOrigin(NSPoint(x: vis.midX - window.frame.width / 2, y: vis.midY - window.frame.height / 2))
+        }
+        window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(note)
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -340,8 +348,9 @@ final class AnnotateController: NSObject, NSWindowDelegate {
             fillW,
         ])
         // 窗口大小：按截图比例（最多 1.5 倍原尺寸），不小于 900x620，不超过屏幕可视区 90%
-        let vis = NSScreen.main?.visibleFrame.size ?? NSSize(width: 1400, height: 900)
-        let px = NSScreen.main?.backingScaleFactor ?? 2
+        let scr = targetScreen ?? NSScreen.main
+        let vis = scr?.visibleFrame.size ?? NSSize(width: 1400, height: 900)
+        let px = scr?.backingScaleFactor ?? 2
         let w = min(max(canvas.iw * 1.5 / px + 48, 900), vis.width * 0.9)
         let fitH = min((w - 48) * canvas.ih / canvas.iw, canvas.ih * 1.5 / px)
         let h = min(max(fitH + topInset + bottomInset, 620), vis.height * 0.9)
