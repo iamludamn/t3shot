@@ -3,13 +3,15 @@ import AppKit
 
 // MARK: - 批注模型
 
-enum Mark { case pen([CGPoint]), rect(CGRect) }
+enum Mark { case arrow(CGPoint, CGPoint), rect(CGRect), text(CGPoint, String) }
 
 final class Canvas: NSView {
     let image: NSImage
     let iw: CGFloat, ih: CGFloat
     var marks: [Mark] = []
-    var tool = 0                    // 0 矩形（默认）1 画笔（手动切换）
+    var tool = 0 // 矩形、箭头、文字
+    var zoom: CGFloat = 1 { didSet { zoom = min(4, max(1, zoom)); needsDisplay = true } }
+    private var pan = CGPoint.zero
     var current: Mark?
     private var startPt = CGPoint.zero
 
@@ -28,8 +30,8 @@ final class Canvas: NSView {
         CGRect(x: insets.left, y: insets.bottom, width: max(bounds.width - insets.left - insets.right, 1),
                height: max(bounds.height - insets.top - insets.bottom, 1))
     }
-    private var scale: CGFloat { min(fitRect.width / iw, fitRect.height / ih, 1.5 / (window?.backingScaleFactor ?? 2)) }   // 小截图最多放大到 1.5 倍原尺寸
-    private var origin: CGPoint { CGPoint(x: fitRect.midX - iw * scale / 2, y: fitRect.midY - ih * scale / 2) }
+    private var scale: CGFloat { min(fitRect.width / iw, fitRect.height / ih, 1.5 / (window?.backingScaleFactor ?? 2)) * zoom }   // 小截图最多放大到 1.5 倍原尺寸
+    private var origin: CGPoint { CGPoint(x: fitRect.midX - iw * scale / 2 + pan.x, y: fitRect.midY - ih * scale / 2 + pan.y) }
     private let cornerRadius: CGFloat = 12
     private static let backdrop = NSColor(name: nil) { ap in
         ap.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? NSColor(white: 0.10, alpha: 1) : NSColor(white: 0.90, alpha: 1)
@@ -44,10 +46,17 @@ final class Canvas: NSView {
             let p = NSBezierPath()
             p.lineWidth = lineWidth; p.lineCapStyle = .round; p.lineJoinStyle = .round
             switch m {
-            case .pen(let pts):
-                guard let f = pts.first else { continue }
-                p.move(to: f); pts.dropFirst().forEach { p.line(to: $0) }
-                if pts.count == 1 { p.line(to: CGPoint(x: f.x + 0.1, y: f.y)) }
+            case .arrow(let from, let to):
+                let angle = atan2(to.y - from.y, to.x - from.x)
+                let head = max(lineWidth * 4, iw / 80)
+                p.move(to: from); p.line(to: to)
+                p.move(to: CGPoint(x: to.x - head * cos(angle - .pi / 6), y: to.y - head * sin(angle - .pi / 6)))
+                p.line(to: to)
+                p.line(to: CGPoint(x: to.x - head * cos(angle + .pi / 6), y: to.y - head * sin(angle + .pi / 6)))
+            case .text(let point, let text):
+                let font = NSFont.boldSystemFont(ofSize: max(24, iw / 40))
+                (text as NSString).draw(at: point, withAttributes: [.font: font, .foregroundColor: NSColor(calibratedRed: 1, green: 0.17, blue: 0.17, alpha: 1)])
+                continue
             case .rect(let r): p.appendRect(r)
             }
             p.stroke()
@@ -79,16 +88,27 @@ final class Canvas: NSView {
     override func resetCursorRects() { addCursorRect(bounds, cursor: .crosshair) }
     override func mouseDown(with e: NSEvent) {
         startPt = imagePoint(e)
-        current = tool == 1 ? .pen([startPt]) : .rect(CGRect(origin: startPt, size: .zero))
+        if tool == 2 {
+            let alert = NSAlert(); alert.messageText = "文字批注"; alert.informativeText = "输入要添加到图片上的文字"
+            let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+            alert.accessoryView = field; alert.addButton(withTitle: "添加"); alert.addButton(withTitle: "取消")
+            alert.window.initialFirstResponder = field
+            if alert.runModal() == .alertFirstButtonReturn, !field.stringValue.isEmpty { marks.append(.text(startPt, field.stringValue)); needsDisplay = true }
+            return
+        }
+        current = tool == 1 ? .arrow(startPt, startPt) : .rect(CGRect(origin: startPt, size: .zero))
         needsDisplay = true
     }
     override func mouseDragged(with e: NSEvent) {
         let p = imagePoint(e)
-        if tool == 1, case .pen(var pts)? = current { pts.append(p); current = .pen(pts) }
+        if tool == 1 { current = .arrow(startPt, p) }
         else { current = .rect(CGRect(x: min(startPt.x, p.x), y: min(startPt.y, p.y), width: abs(p.x - startPt.x), height: abs(p.y - startPt.y))) }
         needsDisplay = true
     }
     override func mouseUp(with e: NSEvent) { if let c = current { marks.append(c) }; current = nil; needsDisplay = true }
+
+    override func scrollWheel(with event: NSEvent) { if zoom > 1 { pan.x += event.scrollingDeltaX; pan.y += event.scrollingDeltaY; needsDisplay = true } }
+    func changeZoom(_ factor: CGFloat) { zoom *= factor; if zoom == 1 { pan = .zero }; needsDisplay = true }
 
     func undo() { if !marks.isEmpty { marks.removeLast(); needsDisplay = true } }
     func clear() { marks.removeAll(); needsDisplay = true }
@@ -259,15 +279,15 @@ final class AnnotateController: NSObject, NSWindowDelegate {
 
     private func buildToolbar() -> NSView {
         let barH: CGFloat = 46
-        let seg = NSSegmentedControl(images: [UI.symbol("rectangle"), UI.symbol("pencil")].compactMap { $0 },
+        let seg = NSSegmentedControl(images: [UI.symbol("rectangle"), UI.symbol("arrow.up.right"), UI.symbol("textformat")].compactMap { $0 },
                                      trackingMode: .selectOne, target: self, action: #selector(toolChanged(_:)))
         seg.selectedSegment = 0
-        seg.setToolTip("矩形（默认）", forSegment: 0); seg.setToolTip("画笔（手动画线）", forSegment: 1)
-        seg.setWidth(44, forSegment: 0); seg.setWidth(44, forSegment: 1)
+        seg.setToolTip("矩形（默认）", forSegment: 0); seg.setToolTip("箭头", forSegment: 1); seg.setToolTip("文字", forSegment: 2)
+        seg.setWidth(44, forSegment: 0); seg.setWidth(44, forSegment: 1); seg.setWidth(44, forSegment: 2)
         seg.controlSize = .large
         if #available(macOS 26, *) { seg.borderShape = .capsule }
         let segBox = NSStackView(views: [seg]); segBox.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 8)
-        let actBox = NSStackView(views: [iconButton("arrow.uturn.backward", tip: "撤销  ⌘Z", action: #selector(undo)),
+        let actBox = NSStackView(views: [iconButton("minus.magnifyingglass", tip: "缩小", action: #selector(zoomOut)), iconButton("plus.magnifyingglass", tip: "放大（滚动浏览）", action: #selector(zoomIn)), iconButton("arrow.uturn.backward", tip: "撤销  ⌘Z", action: #selector(undo)),
                                          iconButton("trash", tip: "清除全部批注", action: #selector(clearAll))])
         actBox.spacing = 2; actBox.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 8)
         [segBox, actBox].forEach { $0.alignment = .centerY; $0.layoutSubtreeIfNeeded() }
@@ -484,6 +504,8 @@ final class AnnotateController: NSObject, NSWindowDelegate {
 
     // MARK: 动作
 
+    @objc func zoomIn() { canvas.changeZoom(1.25) }
+    @objc func zoomOut() { canvas.changeZoom(0.8) }
     @objc func toolChanged(_ s: NSSegmentedControl) { canvas.tool = s.selectedSegment }
     @objc func undo() { canvas.undo() }
     @objc func clearAll() { canvas.clear() }
